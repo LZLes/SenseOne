@@ -1,0 +1,30 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
+
+# Claude Code local state
+.claude/
+
+# Runtime uploads (GUI-saved images, user/session-specific)
+uploads/
+
+# Research data -- private/large, not shipped with the repo.
+# Structure is kept via the .gitkeep + README stub in each folder;
+# put your own CV/CA files and electrode photos here.
+reference_data/*
+!reference_data/.gitkeep
+!reference_data/README.md
+reference_images/*
+!reference_images/.gitkeep
+!reference_images/README.md
+
+# Auto-generated from the data above -- regenerates on its own as you
+# use the agent, no need to version it.
+electrode_notes/
+literature_vault/
+surface_plots/
+reference_diff/
