@@ -1,22 +1,27 @@
 """
-SenseOne
---------
-A local, Ollama-backed agent with two tools:
-  1. sensor_qc      -> QC a CV/CA/SWV dataset (CSV) against configurable thresholds
-  2. search_literature -> pull recent findings from arXiv + PubMed for a query
+SenseOne (Gemini fork)
+----------------------
+Same tool-calling agent as the local Ollama version, ported to Google's
+Gemini API so it can run as a hosted demo without a local model. One
+Gemini model (gemini-2.5-flash) replaces both qwen3:8b (tool-calling/
+thinking) and qwen2.5vl:7b (vision) -- Gemini is natively multimodal, so
+image_qc.py and literature_figures.py's vision calls use the same model
+and client as this file, via tools/_gemini.py.
 
-Run:
-    ollama pull llama3.1        # or qwen2.5, mistral-nemo, etc. (needs tool-calling support)
+Needs a free API key: https://aistudio.google.com/apikey
+    export GEMINI_API_KEY=...
     python agent.py
 
-This file is intentionally a thin orchestration layer. The actual logic lives in
-tools/sensor_qc.py and tools/literature.py so you (or Claude Code) can extend those
-independently without touching the agent loop.
+This file is intentionally a thin orchestration layer. The actual logic
+lives in tools/*.py so a change to one tool doesn't require touching the
+agent loop -- unchanged from the original design.
 """
 
 import json
-import ollama
 
+from google.genai import types
+
+from tools._gemini import client, MODEL
 from tools.sensor_qc import qc_electrochemical_data, SENSOR_QC_SCHEMA
 from tools.cv_stability import analyze_cv_stability, CV_STABILITY_SCHEMA
 from tools.literature import search_literature, LITERATURE_SCHEMA, note_path, _load_note
@@ -40,8 +45,6 @@ from tools.performance_prediction import (
     correlate_visual_cv_performance, CORRELATE_VISUAL_CV_SCHEMA,
     predict_electrode_performance, PREDICT_ELECTRODE_PERFORMANCE_SCHEMA,
 )
-
-MODEL = "qwen3:8b"  # swap for any tool-calling-capable local model
 
 SYSTEM_PROMPT = """You are a research assistant embedded in an electrochemical
 biosensor lab. You help the researcher:
@@ -205,8 +208,8 @@ biosensor lab. You help the researcher:
       -- pass sub_position, don't average them together as if they were
       replicates of one electrode.
 
-Grounding rules -- these matter because you are a small local model and can
-drift into plausible-sounding but unsupported claims:
+Grounding rules -- these matter because you can drift into plausible-sounding
+but unsupported claims:
   - Never state a specific number, defect, or literature finding unless it
     came from a tool's output in this conversation. If you're inferring or
     speculating rather than reporting a tool result, say so explicitly
@@ -255,77 +258,105 @@ AVAILABLE_FUNCTIONS = {
     "predict_electrode_performance": predict_electrode_performance,
 }
 
-# Lower than Ollama's default (0.8) -- this agent reports specific numbers and
+_LITERATURE_TOOL_NAMES = {"search_literature", "analyze_literature_figures"}
+
+
+def _to_gemini_tool(tools: list) -> types.Tool:
+    """Our TOOLS schemas are the OpenAI/Ollama-style {"type": "function",
+    "function": {name, description, parameters}} shape. Gemini's
+    FunctionDeclaration takes a raw JSON-schema dict directly via
+    parameters_json_schema, so this is a reshape, not a rewrite of any
+    tool's actual schema.
+    """
+    declarations = [
+        types.FunctionDeclaration(
+            name=schema["function"]["name"],
+            description=schema["function"].get("description", ""),
+            parameters_json_schema=schema["function"].get("parameters", {"type": "object", "properties": {}}),
+        )
+        for schema in tools
+    ]
+    return types.Tool(function_declarations=declarations)
+
+
+GEMINI_TOOL = _to_gemini_tool(TOOLS)
+
+# Lower than the default -- this agent reports specific numbers and
 # citations, where creative token sampling shows up as fabricated-sounding
 # detail rather than useful variety. Doesn't eliminate hallucination, just
 # reduces one source of it.
-CHAT_OPTIONS = {"temperature": 0.2}
+GENERATE_CONFIG = types.GenerateContentConfig(
+    system_instruction=SYSTEM_PROMPT,
+    tools=[GEMINI_TOOL],
+    thinking_config=types.ThinkingConfig(include_thoughts=True),
+    temperature=0.2,
+)
 
 
-def _sized_options(messages) -> dict:
-    """Ollama silently truncates context that exceeds num_ctx rather than
-    erroring (confirmed the hard way: tools/vault_maintenance.py's insights
-    generator came back covering 8 of 18 papers and ignoring the requested
-    structure before this fix). The default here (4096, per `ollama ps`) is
-    already smaller than SYSTEM_PROMPT + TOOLS alone (~5k tokens) -- meaning
-    every turn of this conversation has likely been silently truncating
-    before a single user message is even added. Size num_ctx to the actual
-    conversation instead of trusting the default, and grow it as
-    conversation history + tool results accumulate turn over turn.
-    """
-    text = json.dumps(TOOLS) + "".join(str(m.get("content", "")) for m in messages)
-    estimated_tokens = len(text) // 3  # conservative chars-per-token estimate
-    num_ctx = max(4096, min(32768, estimated_tokens + 2048))
-    return {**CHAT_OPTIONS, "num_ctx": num_ctx}
-
-
-def run_tool_call(call) -> str:
-    fn_name = call["function"]["name"]
-    args = call["function"]["arguments"]
-    if isinstance(args, str):
-        args = json.loads(args)
-
-    fn = AVAILABLE_FUNCTIONS.get(fn_name)
+def run_tool_call(name: str, args: dict) -> dict:
+    fn = AVAILABLE_FUNCTIONS.get(name)
     if fn is None:
-        return f"Error: unknown tool '{fn_name}'"
-
+        return {"error": f"unknown tool '{name}'"}
     try:
         result = fn(**args)
     except Exception as e:  # keep the agent alive even if a tool errors out
         result = {"error": str(e)}
-
-    return json.dumps(result, default=str)
-
-
-def _print_thinking(msg):
-    thinking = msg.get("thinking")
-    if thinking:
-        print(f"  [thinking] {thinking.strip()}\n")
+    # Round-trip through json to normalize numpy/Path/etc. into plain types
+    # -- the SDK needs a plain JSON-serializable dict for function_response.
+    return json.loads(json.dumps(result, default=str))
 
 
-_LITERATURE_TOOL_NAMES = {"search_literature", "analyze_literature_figures"}
+def run_hops(contents: list) -> list:
+    """Repeatedly calls Gemini, executing any function calls it returns and
+    feeding the results back, until it answers with no further function
+    calls. Mutates `contents` in place (appends the model's turn and any
+    tool-result turns), and returns the final answer turn's parts.
+    """
+    while True:
+        response = client().models.generate_content(model=MODEL, contents=contents, config=GENERATE_CONFIG)
+        candidate = response.candidates[0]
+        parts = candidate.content.parts or []
+
+        thinking_text = "".join(p.text for p in parts if getattr(p, "thought", False) and p.text)
+        if thinking_text:
+            print(f"  [thinking] {thinking_text.strip()}\n")
+
+        contents.append(candidate.content)
+
+        function_calls = [p.function_call for p in parts if getattr(p, "function_call", None)]
+        if not function_calls:
+            return parts
+
+        response_parts = []
+        for fc in function_calls:
+            args = dict(fc.args) if fc.args else {}
+            print(f"  [tool] {fc.name}({args})")
+            result = run_tool_call(fc.name, args)
+            response_parts.append(types.Part.from_function_response(name=fc.name, response=result))
+        contents.append(types.Content(role="tool", parts=response_parts))
 
 
-def _collect_cited_papers(messages, since_index) -> set:
+def _collect_cited_papers(contents, since_index) -> set:
     """Scan this turn's tool results for every paper_id touched by a
-    literature tool. This is a deterministic backstop, not a replacement for
-    the system prompt's inline-citation rule -- an 8B model won't reliably
-    remember to cite every claim in prose, but every paper it actually
-    consulted can still be listed with certainty from the tool results.
+    literature tool. Deterministic backstop, not a replacement for the
+    system prompt's inline-citation rule -- a model won't reliably remember
+    to cite every claim in prose, but every paper it actually consulted can
+    still be listed with certainty from the tool results.
     """
     paper_ids = set()
-    for m in messages[since_index:]:
-        if m.get("role") != "tool" or m.get("name") not in _LITERATURE_TOOL_NAMES:
+    for c in contents[since_index:]:
+        if c.role != "tool":
             continue
-        try:
-            data = json.loads(m["content"])
-        except (json.JSONDecodeError, TypeError):
-            continue
-        for r in data.get("results", []) or []:
-            if r.get("paper_id"):
-                paper_ids.add(r["paper_id"])
-        if data.get("paper_id"):
-            paper_ids.add(data["paper_id"])
+        for part in c.parts or []:
+            fr = getattr(part, "function_response", None)
+            if fr is None or fr.name not in _LITERATURE_TOOL_NAMES:
+                continue
+            data = fr.response or {}
+            for r in data.get("results", []) or []:
+                if r.get("paper_id"):
+                    paper_ids.add(r["paper_id"])
+            if data.get("paper_id"):
+                paper_ids.add(data["paper_id"])
     return paper_ids
 
 
@@ -342,8 +373,8 @@ def _format_sources(paper_ids) -> str:
 
 
 def chat_loop():
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    print(f"SenseOne ready (model: {MODEL}). Ctrl+C to quit.\n")
+    contents = []
+    print(f"SenseOne ready (model: {MODEL}, via Gemini API). Ctrl+C to quit.\n")
 
     while True:
         try:
@@ -355,32 +386,14 @@ def chat_loop():
         if not user_input:
             continue
 
-        messages.append({"role": "user", "content": user_input})
-        turn_start = len(messages)
+        contents.append(types.Content(role="user", parts=[types.Part.from_text(text=user_input)]))
+        turn_start = len(contents)
 
-        response = ollama.chat(model=MODEL, messages=messages, tools=TOOLS, think=True, options=_sized_options(messages))
-        msg = response["message"]
-        _print_thinking(msg)
+        final_parts = run_hops(contents)
 
-        # Keep resolving tool calls until the model gives a plain answer.
-        # Most turns will do at most 1-2 hops (e.g. search -> answer).
-        while msg.get("tool_calls"):
-            messages.append(msg)
-            for call in msg["tool_calls"]:
-                tool_result = run_tool_call(call)
-                print(f"  [tool] {call['function']['name']}({call['function']['arguments']})")
-                messages.append({
-                    "role": "tool",
-                    "name": call["function"]["name"],
-                    "content": tool_result,
-                })
-            response = ollama.chat(model=MODEL, messages=messages, tools=TOOLS, think=True, options=_sized_options(messages))
-            msg = response["message"]
-            _print_thinking(msg)
-
-        cited_papers = _collect_cited_papers(messages, turn_start)
-        messages.append(msg)
-        print(f"\nagent> {msg['content']}\n")
+        cited_papers = _collect_cited_papers(contents, turn_start)
+        answer = "".join(p.text for p in final_parts if p.text and not getattr(p, "thought", False))
+        print(f"\nagent> {answer}\n")
         if cited_papers:
             print(f"  sources:\n{_format_sources(cited_papers)}\n")
 

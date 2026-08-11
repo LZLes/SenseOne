@@ -25,13 +25,13 @@ import json
 import re
 
 import fitz  # PyMuPDF
-import ollama
 import requests
+from google.genai import types
 from PIL import Image
 
+from tools._gemini import client, MODEL
 from tools.literature import VAULT_DIR, _load_note, append_figures_section, note_path
 
-VISION_MODEL = "qwen2.5vl:7b"
 FIGURES_DIR = VAULT_DIR / "figures"
 MIN_FIGURE_DIM = 200  # px; filters out logos/icons/decorative marks
 
@@ -171,13 +171,13 @@ def _downsize_for_captioning(image_bytes: bytes) -> bytes:
 def _caption_figure(image_bytes: bytes, context: str = "") -> dict:
     context_line = f"\nAdditional context: {context}\n" if context else ""
     prompt = _CAPTION_PROMPT_TEMPLATE.format(context_line=context_line)
-    response = ollama.chat(
-        model=VISION_MODEL,
-        messages=[{"role": "user", "content": prompt, "images": [_downsize_for_captioning(image_bytes)]}],
-        format="json",
+    response = client().models.generate_content(
+        model=MODEL,
+        contents=[prompt, types.Part.from_bytes(data=_downsize_for_captioning(image_bytes), mime_type="image/jpeg")],
+        config=types.GenerateContentConfig(response_mime_type="application/json"),
     )
     try:
-        parsed = json.loads(response["message"]["content"])
+        parsed = json.loads(response.text)
     except json.JSONDecodeError:
         parsed = {"figure_type": "other", "description": "(caption failed to parse)", "quality_note": ""}
     parsed.setdefault("figure_type", "other")

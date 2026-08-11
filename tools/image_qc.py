@@ -2,9 +2,10 @@
 Image QC tool.
 
 Visually inspects a photo of a screen-printed electrode (SPE) sensor for
-manufacturing defects, before the sensor is run electrochemically. Uses a
-vision-capable Ollama model (separate from the main chat model) to look at
-the image and return structured flags.
+manufacturing defects, before the sensor is run electrochemically. Uses the
+same Gemini model as the main chat agent (natively multimodal, so no
+separate vision model is needed) to look at the image and return
+structured flags.
 
 Electrodes are laid out on a lettered/numbered grid (e.g. "E5"), and not
 every position has a photo. If the exact electrode isn't available, this
@@ -32,16 +33,17 @@ import matplotlib
 matplotlib.use("Agg")  # headless -- this runs as a tool, not an interactive session
 import matplotlib.pyplot as plt
 import numpy as np
-import ollama
+from google.genai import types
 from matplotlib.colors import LightSource
 from PIL import Image
 from scipy.ndimage import gaussian_filter
 from scipy.stats import kurtosis, skew
 
+from tools._gemini import client, MODEL
 from tools.electrode_notes import append_qc_result, extract_batch_date, extract_grid_code
 
-VISION_MODEL = "qwen2.5vl:7b"  # needs `ollama pull qwen2.5vl:7b`
 _IMAGE_EXTS = (".bmp", ".jpg", ".jpeg", ".png")
+_MIME_TYPES = {".bmp": "image/bmp", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png"}
 _GRID_CODE_RE = re.compile(r"^([A-Za-z])(\d+)$")
 SURFACE_PLOTS_DIR = Path("surface_plots")
 
@@ -538,13 +540,14 @@ def qc_sensor_image(
     context_line = f"\nAdditional context: {context}\n" if context else ""
     prompt = _PROMPT_TEMPLATE.format(context_line=context_line)
 
-    response = ollama.chat(
-        model=VISION_MODEL,
-        messages=[{"role": "user", "content": prompt, "images": [image_path]}],
-        format="json",
+    mime_type = _MIME_TYPES.get(Path(image_path).suffix.lower(), "image/jpeg")
+    response = client().models.generate_content(
+        model=MODEL,
+        contents=[prompt, types.Part.from_bytes(data=Path(image_path).read_bytes(), mime_type=mime_type)],
+        config=types.GenerateContentConfig(response_mime_type="application/json"),
     )
 
-    content = response["message"]["content"]
+    content = response.text
     try:
         parsed = json.loads(content)
     except json.JSONDecodeError:

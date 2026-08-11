@@ -1,16 +1,15 @@
 #!/usr/bin/env bash
-# One-command setup for SenseOne: pulls the two Ollama models, creates a
-# venv, and installs Python deps. Safe to re-run.
+# One-command setup for SenseOne (Gemini fork): creates a venv, installs
+# deps, and checks for a Gemini API key. Safe to re-run.
 set -euo pipefail
 
-if ! command -v ollama >/dev/null 2>&1; then
-    echo "Ollama not found on PATH. Install it first: https://ollama.com/download"
+if [ -z "${GEMINI_API_KEY:-}" ]; then
+    echo "GEMINI_API_KEY is not set."
+    echo "Get a free key at https://aistudio.google.com/apikey, then:"
+    echo "  export GEMINI_API_KEY=..."
+    echo "and re-run this script (or just set it before running agent.py/app.py)."
     exit 1
 fi
-
-echo "== Pulling models (qwen3:8b ~5.2GB, qwen2.5vl:7b ~6.0GB) -- this can take a while on first run =="
-ollama pull qwen3:8b
-ollama pull qwen2.5vl:7b
 
 echo "== Setting up Python environment =="
 python3 -m venv .venv
@@ -26,7 +25,7 @@ Setup complete.
 Activate the environment in new shells with:
   source .venv/bin/activate
 
-Then run either:
+Make sure GEMINI_API_KEY is exported in that shell too, then run either:
   python agent.py          # terminal chat
   streamlit run app.py     # local web GUI (localhost:8501)
 

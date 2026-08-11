@@ -24,13 +24,13 @@ import re
 from datetime import date
 from pathlib import Path
 
-import ollama
+from google.genai import types
 
+from tools._gemini import client, MODEL
 from tools.literature import VAULT_DIR, _load_note, _normalize_query, search_literature
 from tools.literature_figures import analyze_literature_figures
 
 INSIGHTS_PATH = VAULT_DIR / "INSIGHTS.md"
-INSIGHTS_MODEL = "qwen3:8b"  # same as agent.py's MODEL; kept as its own constant so this module has no import-order dependency on agent.py
 
 VAULT_MAINTENANCE_SCHEMA = {
     "type": "function",
@@ -176,22 +176,12 @@ def _generate_insights() -> str:
 
     prompt = _INSIGHTS_PROMPT_TEMPLATE.format(vault_content=vault_content)
 
-    # Ollama defaults this model to a 4096-token context regardless of what
-    # the model itself supports (confirmed via `ollama ps` earlier) -- a
-    # vault-wide prompt blows past that silently (no error, just quietly
-    # truncated input) rather than failing loudly, which is what actually
-    # happened here: an 18-paper sweep came back covering 8 papers and
-    # ignoring the requested section structure. Size the window to the
-    # prompt instead of trusting the default.
-    estimated_tokens = len(prompt) // 3  # conservative chars-per-token estimate
-    num_ctx = max(4096, min(32768, estimated_tokens + 2048))
-
-    response = ollama.chat(
-        model=INSIGHTS_MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        options={"temperature": 0.2, "num_ctx": num_ctx},
+    response = client().models.generate_content(
+        model=MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(temperature=0.2),
     )
-    content = response["message"]["content"].strip()
+    content = response.text.strip()
 
     # Models sometimes wrap markdown output in a stray ```markdown fence --
     # strip it so INSIGHTS.md renders as markdown, not a literal code block.

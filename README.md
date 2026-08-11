@@ -1,28 +1,36 @@
-# SenseOne
+# SenseOne (Gemini fork)
 
-A local, Ollama-backed research assistant for an electrochemical
-biosensor (screen-printed electrode) lab. Everything runs on-device —
-no data leaves your machine. It QCs raw CV/CA data, visually QCs
-electrode photos, tracks every result against the same physical
-electrode across sessions, searches and caches literature, and (as
-enough paired data accumulates) tries to answer the actual question
-the lab cares about: does an electrode's photo predict how well it'll
-perform electrically, before you run it?
+A Gemini-backed research assistant for an electrochemical biosensor
+(screen-printed electrode) lab. This is a fork of the original local,
+Ollama-backed SenseOne -- same tools, same system prompt, same
+architecture, with the LLM backend swapped from local Ollama models to
+the Gemini API so it can be shared as a hosted link instead of
+requiring everyone to install Ollama + pull ~11GB of models. See
+[`../ai_qc_agent`](../ai_qc_agent) for the local-only original.
+It QCs raw CV/CA data, visually QCs electrode photos, tracks every
+result against the same physical electrode across sessions, searches
+and caches literature, and (as enough paired data accumulates) tries
+to answer the actual question the lab cares about: does an electrode's
+photo predict how well it'll perform electrically, before you run it?
+
+**Tradeoff of this fork:** your data and prompts go to Google's API
+instead of staying fully on-device (see [Gemini API terms](https://ai.google.dev/gemini-api/terms)
+for how free-tier usage is handled). Prefer the original if that
+matters for your data.
 
 ## Setup
 
 ```bash
-# install and start Ollama first: https://ollama.com/download
+# get a free key: https://aistudio.google.com/apikey
+export GEMINI_API_KEY=...
 
-./setup.sh   # pulls both models, creates a venv, installs deps
+./setup.sh   # creates a venv, installs deps, checks the key is set
 ```
 
 or by hand:
 
 ```bash
-ollama pull qwen3:8b        # main chat model -- tool-calling + reasoning
-ollama pull qwen2.5vl:7b    # vision model -- used internally by image tools
-
+export GEMINI_API_KEY=...
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
@@ -35,14 +43,17 @@ streamlit run app.py        # local web GUI (localhost:8501) -- image upload,
                              # live thinking stream, inline plots/photos
 ```
 
-If you're on limited memory (this was built/tested on an 18GB Apple
-Silicon Mac), see the `OLLAMA_*` env vars mentioned in "Running
-efficiently" below before you start chatting.
+One Gemini model (`gemini-2.5-flash`, set in `tools/_gemini.py`) handles
+tool-calling, reasoning, and vision -- unlike the Ollama version, no
+separate vision model is needed. Check
+[the current model list](https://ai.google.dev/gemini-api/docs/models)
+if that model has since been deprecated or a better free-tier option
+exists.
 
-Everything (models, data, generated notes) stays on your machine --
-nothing here talks to a remote server except the literature search,
-which hits public PubMed/arXiv APIs. `reference_data/` and
-`reference_images/` ship empty (see the README in each) since your lab
+Everything except the LLM calls still stays local -- CV/CA/image data,
+generated notes, and plots are all written to disk exactly as in the
+Ollama version. `reference_data/` and `reference_images/` ship empty
+(see the README in each) since your lab
 data is yours to keep private or share separately; everything else
 (`electrode_notes/`, `literature_vault/`, `surface_plots/`,
 `reference_diff/`) regenerates automatically as you use the agent.
@@ -189,18 +200,13 @@ you> Update the literature vault
   if it can't be tied to a specific paper, it's flagged as the model's
   own inference instead.
 
-## Running efficiently (Apple Silicon / limited memory)
+## Rate limits and cost
 
-Ollama already uses the GPU (Metal) automatically. If you're tight on
-RAM, these env vars help a lot (`launchctl setenv ...` then restart
-Ollama, since it runs as a background app, not a shell process):
-
-```bash
-launchctl setenv OLLAMA_MAX_LOADED_MODELS 1   # don't keep both models resident at once
-launchctl setenv OLLAMA_FLASH_ATTENTION 1
-launchctl setenv OLLAMA_KV_CACHE_TYPE q8_0    # halves context-cache memory
-launchctl setenv OLLAMA_KEEP_ALIVE 3m         # free idle models sooner
-```
+Gemini's free tier has requests-per-minute/day quotas that change over
+time -- check [current limits](https://ai.google.dev/gemini-api/docs/rate-limits)
+before a demo with several simultaneous users. Every visitor's usage
+draws on whichever `GEMINI_API_KEY` the app is running with, not
+their own -- there's no per-user key handling here.
 
 ## Project layout
 
@@ -208,6 +214,7 @@ launchctl setenv OLLAMA_KEEP_ALIVE 3m         # free idle models sooner
 agent.py                    # CLI chat loop -- system prompt, tool registry, orchestration
 app.py                      # Streamlit GUI -- same tools, adds upload + live thinking + inline images
 tools/
+  _gemini.py                  # shared Gemini client + model constant
   sensor_qc.py               # single-scan CV/CA/SWV QC
   cv_stability.py            # multi-scan CV stability (peak current/ΔEp drift, artifacts)
   ca_calibration.py          # CA calibration curve analysis (LOD, sensitivity, saturation)

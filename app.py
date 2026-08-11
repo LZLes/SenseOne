@@ -1,17 +1,14 @@
 """
-SenseOne -- local web GUI (Streamlit).
+SenseOne (Gemini fork) -- web GUI (Streamlit).
 
-Thin presentation layer over agent.py: reuses its SYSTEM_PROMPT, TOOLS,
-run_tool_call, and _sized_options directly rather than re-implementing the
-tool-calling loop. Beyond the CLI, this adds: inline display of the
-images/plots the tools already generate (surface plots, batch-diff
-visualizations, electrode photos) directly in the chat, a live
-token-by-token view of the model's thinking instead of a wall of silence
-until it's done, and a way to upload a new photo from the browser (the
-tools all take a file path -- an uploaded image is saved to uploads/ and
-its path handed to the model).
+Same presentation layer as the local Ollama version, adapted to the
+Gemini API's Content/Part message shape (see agent.py's docstring for
+why this fork exists). Reuses agent.py's SYSTEM_PROMPT (via
+GENERATE_CONFIG), TOOLS, and run_tool_call directly rather than
+reimplementing the tool-calling loop.
 
 Run:
+    export GEMINI_API_KEY=...   # https://aistudio.google.com/apikey
     streamlit run app.py
 """
 
@@ -20,6 +17,7 @@ import os
 from pathlib import Path
 
 import streamlit as st
+from google.genai import types
 
 import agent
 
@@ -87,61 +85,70 @@ def _render_image_gallery(images):
             st.image(path, caption=label)
 
 
-def _stream_turn(messages: list, collected_images: list) -> str:
+def _stream_turn(contents: list, collected_images: list) -> str:
     """Streams each hop live (thinking token-by-token, then content), runs
-    any tool calls that come back, and loops until the model gives a final
-    answer with no further tool calls. Only the final, tool-call-free hop's
-    content is treated as the real answer -- intermediate hops sometimes
-    stream raw tool-call syntax through the content field before Ollama
-    finishes parsing it into a structured tool call, which isn't meant to
-    be shown as a chat message.
+    any function calls that come back, and loops until the model gives a
+    final answer with no further function calls. Only the final,
+    function-call-free hop's text is treated as the real answer --
+    intermediate hops' content is a partial/incomplete read meant to lead
+    into a tool call, not a chat message.
     """
     while True:
         thinking_slot = None
         content_slot = st.empty()
         thinking_acc = ""
         content_acc = ""
-        tool_calls = None
+        parts_acc = []
+        function_calls = []
 
-        stream = agent.ollama.chat(
-            model=agent.MODEL, messages=messages, tools=agent.TOOLS,
-            think=True, options=agent._sized_options(messages), stream=True,
+        stream = agent.client().models.generate_content_stream(
+            model=agent.MODEL, contents=contents, config=agent.GENERATE_CONFIG,
         )
         for chunk in stream:
-            m = chunk["message"]
-            if m.get("thinking"):
-                if thinking_slot is None:
-                    thinking_slot = st.expander("\U0001f9e0 thinking", expanded=True).empty()
-                thinking_acc += m["thinking"]
-                thinking_slot.markdown(thinking_acc)
-            if m.get("content"):
-                content_acc += m["content"]
-                content_slot.markdown(content_acc + "▌")
-            if m.get("tool_calls"):
-                tool_calls = m["tool_calls"]
+            if not chunk.candidates or not chunk.candidates[0].content:
+                continue
+            chunk_parts = chunk.candidates[0].content.parts
+            if not chunk_parts:
+                continue
+            for part in chunk_parts:
+                parts_acc.append(part)
+                if getattr(part, "thought", False) and part.text:
+                    if thinking_slot is None:
+                        thinking_slot = st.expander("\U0001f9e0 thinking", expanded=True).empty()
+                    thinking_acc += part.text
+                    thinking_slot.markdown(thinking_acc)
+                elif getattr(part, "function_call", None):
+                    function_calls.append(part.function_call)
+                elif part.text:
+                    content_acc += part.text
+                    content_slot.markdown(content_acc + "▌")
 
-        assistant_msg = {"role": "assistant", "content": content_acc}
-        if tool_calls:
-            assistant_msg["tool_calls"] = tool_calls
-            content_slot.empty()  # intermediate hop -- don't display raw/leaked content as a chat message
+        if function_calls:
+            content_slot.empty()  # intermediate hop -- don't display raw content as a chat message
         else:
             content_slot.markdown(content_acc) if content_acc else content_slot.empty()
 
-        messages.append(assistant_msg)
+        contents.append(types.Content(role="model", parts=parts_acc))
 
-        if not tool_calls:
+        if not function_calls:
             return content_acc
 
-        for call in tool_calls:
-            tool_result = agent.run_tool_call(call)
-            _render_tool_call(call, tool_result, collected_images)
-            messages.append({"role": "tool", "name": call["function"]["name"], "content": tool_result})
+        response_parts = []
+        for fc in function_calls:
+            args = dict(fc.args) if fc.args else {}
+            call_display = {"function": {"name": fc.name, "arguments": args}}
+            result = agent.run_tool_call(fc.name, args)
+            result_str = json.dumps(result, default=str)
+            _render_tool_call(call_display, result_str, collected_images)
+            response_parts.append(types.Part.from_function_response(name=fc.name, response=result))
+
+        contents.append(types.Content(role="tool", parts=response_parts))
 
 
-if "messages" not in st.session_state:
-    st.session_state.messages = [{"role": "system", "content": agent.SYSTEM_PROMPT}]
+if "contents" not in st.session_state:
+    st.session_state.contents = []
 if "turn_images" not in st.session_state:
-    st.session_state.turn_images = {}  # user-message index (in st.session_state.messages) -> [(label, path), ...]
+    st.session_state.turn_images = {}  # contents index -> [(label, path), ...]
 if "uploader_key" not in st.session_state:
     st.session_state.uploader_key = 0
 if "pending_upload_path" not in st.session_state:
@@ -149,9 +156,11 @@ if "pending_upload_path" not in st.session_state:
 
 with st.sidebar:
     st.header("SenseOne")
-    st.caption(f"model: `{agent.MODEL}`")
+    st.caption(f"model: `{agent.MODEL}` (Gemini API)")
+    if not os.environ.get("GEMINI_API_KEY"):
+        st.error("GEMINI_API_KEY is not set -- see README for setup.")
     if st.button("New conversation"):
-        st.session_state.messages = [{"role": "system", "content": agent.SYSTEM_PROMPT}]
+        st.session_state.contents = []
         st.session_state.turn_images = {}
         st.rerun()
 
@@ -178,16 +187,18 @@ with st.sidebar:
             st.text(f"{batch_dir.name}  ({n} photos)")
 
 st.title("\U0001f52c SenseOne")
-st.caption("Local, Ollama-backed research assistant for the electrochemical biosensor lab.")
+st.caption("Gemini-backed research assistant for the electrochemical biosensor lab.")
 
-for i, msg in enumerate(st.session_state.messages[1:], start=1):
-    if msg["role"] == "user":
+for i, content in enumerate(st.session_state.contents):
+    if content.role == "user":
         with st.chat_message("user"):
-            st.markdown(msg["content"])
-    elif msg["role"] == "assistant" and msg.get("content") and not msg.get("tool_calls"):
-        with st.chat_message("assistant"):
-            st.markdown(msg["content"])
-            _render_image_gallery(st.session_state.turn_images.get(i, []))
+            st.markdown("".join(p.text for p in content.parts if p.text))
+    elif content.role == "model" and not any(getattr(p, "function_call", None) for p in content.parts):
+        text = "".join(p.text for p in content.parts if p.text and not getattr(p, "thought", False))
+        if text:
+            with st.chat_message("assistant"):
+                st.markdown(text)
+                _render_image_gallery(st.session_state.turn_images.get(i, []))
 
 user_input = st.chat_input("Ask about a sensor, image, paper, or batch...")
 if user_input:
@@ -196,16 +207,16 @@ if user_input:
     st.session_state.pending_upload_path = None
     st.session_state.uploader_key += 1  # force a fresh, empty uploader widget so this file isn't re-attached to later messages
 
-    st.session_state.messages.append({"role": "user", "content": model_input})
+    st.session_state.contents.append(types.Content(role="user", parts=[types.Part.from_text(text=model_input)]))
     with st.chat_message("user"):
         st.markdown(user_input)
         if pending:
             st.caption(f"\U0001f4ce {pending}")
     with st.chat_message("assistant"):
         images = []
-        _stream_turn(st.session_state.messages, images)
+        _stream_turn(st.session_state.contents, images)
         _render_image_gallery(images)
         if images:
-            # final assistant message is the last one appended
-            st.session_state.turn_images[len(st.session_state.messages) - 1] = images
+            # final assistant turn is the last one appended
+            st.session_state.turn_images[len(st.session_state.contents) - 1] = images
     st.rerun()
