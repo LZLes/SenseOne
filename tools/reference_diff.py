@@ -25,9 +25,22 @@ Each image is now registered (translation-only phase cross-correlation)
 against the batch average before comparison, in two passes -- align to an
 arbitrary first image, re-align to the resulting preliminary average -- and
 a margin is trimmed post-alignment to drop shift-induced edge artifacts.
+
+Which batch/sheet(s) a photo compares against, by default: if the caller
+gives image_dir/batch explicitly, the average is built from that one
+batch+sheet only, same as always. If image_dir/batch is omitted, the batch
+identity itself matters less than which electrodes were actually printed
+the same way -- so the reference pools together every batch/sheet on record
+(via electrode_notes' set_batch_metadata) that shares the target's own
+carbon ink formula, giving a bigger, more representative "average electrode"
+than any one small batch alone. Requires that ink formula actually be
+recorded for the target's batch/sheet; if it isn't, compare_to_batch_reference
+says so plainly rather than silently falling back to a single-batch average
+or guessing a formula.
 """
 
 import json
+import re
 from pathlib import Path
 
 import matplotlib
@@ -38,7 +51,10 @@ from scipy.ndimage import shift as nd_shift
 from skimage.metrics import structural_similarity
 from skimage.registration import phase_cross_correlation
 
-from tools.electrode_notes import append_qc_result, extract_batch_date, extract_grid_code
+from tools.electrode_notes import (
+    BATCH_INFO_FILENAME, NOTES_DIR, _load_note, append_qc_result, extract_batch_date,
+    extract_grid_code, get_batch_metadata,
+)
 from tools.image_qc import (
     DEFAULT_CROP_BOX, _index_grid_images, _luminance_grid, _parse_filename_identity,
     _resolve_electrode_image, _split_key,
@@ -63,19 +79,29 @@ REFERENCE_DIFF_SCHEMA = {
     "function": {
         "name": "compare_to_batch_reference",
         "description": (
-            "Compare one electrode photo against the average of every other electrode in "
-            "its batch (unsupervised -- no labeled 'good' example needed) and report how much "
-            "it deviates (SSIM similarity score + percentile rank within the batch). Large "
-            "deviation flags a print worth a manual look. Builds and caches the batch average "
-            "on first use for a given image_dir; pass force_rebuild=true after adding new "
-            "photos to that directory."
+            "Compare one electrode photo against the average of other electrodes (unsupervised "
+            "-- no labeled 'good' example needed) and report how much it deviates (SSIM "
+            "similarity score + percentile rank within the reference pool). Large deviation "
+            "flags a print worth a manual look. Omit image_dir/batch to auto-pool the reference "
+            "from every batch/sheet on record sharing the target's own carbon ink formula "
+            "(bigger, more representative average than one batch alone) -- requires that ink "
+            "formula be recorded via set_batch_metadata first, or it errors rather than "
+            "guessing. Pass image_dir/batch to instead compare against just that one batch's "
+            "own average. Builds and caches the reference average on first use; pass "
+            "force_rebuild=true after adding new photos or updating ink-formula metadata."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "image_dir": {
                     "type": "string",
-                    "description": "Directory of grid-labeled electrode photos forming the batch, e.g. reference_images/20260707. Or pass batch instead.",
+                    "description": (
+                        "Directory of grid-labeled electrode photos to scope the reference average "
+                        "to, e.g. reference_images/20260707. Or pass batch instead. Omit both to "
+                        "auto-pool by the target's carbon ink formula instead (see tool description) "
+                        "-- requires image_path (a photo whose own batch/sheet can be read from its "
+                        "filename) in that case, not electrode_code."
+                    ),
                 },
                 "batch": {
                     "type": "string",
@@ -115,10 +141,9 @@ REFERENCE_DIFF_SCHEMA = {
                 },
                 "force_rebuild": {
                     "type": "boolean",
-                    "description": "Recompute the batch average instead of using the cached one. Default false.",
+                    "description": "Recompute the reference average instead of using the cached one. Default false.",
                 },
             },
-            "required": ["image_dir"],
         },
     },
 }
@@ -128,15 +153,47 @@ def _batch_cache_dir(image_dir: str, sheet: str = None) -> Path:
     return REFERENCE_DIFF_DIR / Path(image_dir).name / (sheet or "_all")
 
 
-def build_batch_reference(image_dir: str, sheet: str = None, crop_box=DEFAULT_CROP_BOX, force_rebuild: bool = False) -> dict:
-    """sheet restricts to one sheet's photos -- required for a directory
-    with multiple sheets (e.g. batch 20260805 has S1 and S3), since
-    different sheets can use different ink formulas; averaging across them
-    would produce a meaningless "typical" reference and corrupt every SSIM
-    score. Leave sheet=None for a single-sheet batch (all entries share the
-    same, sheet-less key already).
+def _ink_cache_dir(carbon_ink_formula: str) -> Path:
+    slug = re.sub(r"[^a-z0-9]+", "_", carbon_ink_formula.strip().lower()).strip("_") or "unknown"
+    return REFERENCE_DIFF_DIR / "_by_ink" / slug
+
+
+def _find_sheets_by_carbon_ink(carbon_ink_formula: str) -> list:
+    """Every (batch, sheet_number) on record (via set_batch_metadata) whose
+    carbon_ink_formula matches, case/whitespace-insensitive. Scans
+    electrode_notes/*/_batch_info.md directly rather than going through
+    get_batch_metadata per-batch, since there's no index of "every batch
+    that exists" to iterate otherwise.
     """
-    cache_dir = _batch_cache_dir(image_dir, sheet)
+    target = carbon_ink_formula.strip().lower()
+    matches = []
+    if not NOTES_DIR.exists():
+        return matches
+    for path in sorted(NOTES_DIR.glob(f"*/{BATCH_INFO_FILENAME}")):
+        try:
+            meta, _ = _load_note(path)
+        except Exception:
+            continue
+        batch = meta.get("batch", path.parent.name)
+        for sheet_number, fields in meta.get("sheets", {}).items():
+            formula = (fields.get("carbon_ink_formula") or "").strip().lower()
+            if formula and formula == target:
+                matches.append((batch, sheet_number))
+    return matches
+
+
+def build_batch_reference(sources: list, cache_dir: Path, crop_box=DEFAULT_CROP_BOX, force_rebuild: bool = False) -> dict:
+    """sources is a list of (image_dir, sheet) pairs pooled together into one
+    average -- normally just one pair (compare against a single batch/sheet),
+    or several when compare_to_batch_reference auto-pools every batch/sheet
+    sharing a target's carbon ink formula (see module docstring). sheet
+    restricts each source dir to one sheet's photos -- required for a
+    directory with multiple sheets (e.g. batch 20260805 has S1 and S3), since
+    different sheets can use different ink formulas; averaging across them
+    within one source would produce a meaningless "typical" reference and
+    corrupt every SSIM score. Leave a source's sheet=None for a single-sheet
+    batch (all entries share the same, sheet-less key already).
+    """
     mean_path = cache_dir / "mean.npy"
     std_path = cache_dir / "std.npy"
     align_ref_path = cache_dir / "align_reference.npy"
@@ -150,20 +207,24 @@ def build_batch_reference(image_dir: str, sheet: str = None, crop_box=DEFAULT_CR
             "scores": json.loads(scores_path.read_text()),
         }
 
-    full_index = _index_grid_images(image_dir)  # {"A1" or "S3-A1": [paths]}
-    index = {k: v for k, v in full_index.items() if _split_key(k)[0] == sheet}
-    if not index:
-        available = sorted({_split_key(k)[0] for k in full_index}) if full_index else []
-        return {"error": (
-            f"No grid-labeled photos for sheet '{sheet}' in {image_dir}."
-            + (f" Sheets found there: {available}." if available else "")
-        )}
-
     codes, raw_grids = [], []
-    for key, paths in sorted(index.items()):
-        primary = sorted(paths, key=lambda p: p.stem.upper().endswith("_L"))[0]  # skip "_L" duplicate shots
-        codes.append(key)
-        raw_grids.append(_luminance_grid(str(primary), GRID_SIZE, True, 1.0, crop_box))
+    missing = []
+    for image_dir, sheet in sources:
+        full_index = _index_grid_images(image_dir)  # {"A1" or "S3-A1": [paths]}
+        index = {k: v for k, v in full_index.items() if _split_key(k)[0] == sheet}
+        if not index:
+            missing.append((image_dir, sheet))
+            continue
+        # Prefix with the source dir so pooling multiple batches can't collide
+        # two different physical electrodes that happen to share a grid code.
+        prefix = Path(image_dir).name
+        for key, paths in sorted(index.items()):
+            primary = sorted(paths, key=lambda p: p.stem.upper().endswith("_L"))[0]  # skip "_L" duplicate shots
+            codes.append(f"{prefix}:{key}")
+            raw_grids.append(_luminance_grid(str(primary), GRID_SIZE, True, 1.0, crop_box))
+
+    if not raw_grids:
+        return {"error": f"No grid-labeled photos found for any of the given source(s): {sources}."}
 
     # Two-pass registration (see module docstring for why this is necessary):
     # align everything to an arbitrary first image, then re-align to the
@@ -197,11 +258,17 @@ def build_batch_reference(image_dir: str, sheet: str = None, crop_box=DEFAULT_CR
 
     fig, ax = plt.subplots(figsize=(5, 5))
     ax.imshow(mean_img, cmap="viridis")
-    ax.set_title(f"batch average, n={len(codes)} (registered)")
+    title = f"reference average, n={len(codes)} across {len(sources) - len(missing)} source(s) (registered)"
+    ax.set_title(title)
     fig.savefig(cache_dir / "mean.png", dpi=120)
     plt.close(fig)
 
-    return {"mean": mean_img, "std": std_img, "align_reference": align_reference, "scores": scores}
+    result = {"mean": mean_img, "std": std_img, "align_reference": align_reference, "scores": scores}
+    if missing:
+        result["missing_sources"] = [
+            {"image_dir": d, "sheet": s} for d, s in missing
+        ]  # recorded in the note-linking caller's flags, not persisted to cache
+    return result
 
 
 def compare_to_batch_reference(
@@ -219,12 +286,18 @@ def compare_to_batch_reference(
     # function needs, which silently errored instead of comparing anything.
     # Resolving it here is more reliable than depending on prompting alone.
     image_dir = image_dir or (f"reference_images/{batch}" if batch else "")
-    if not image_dir:
-        return {"status": "error", "message": "Provide image_dir (e.g. 'reference_images/20260707') or batch (e.g. '20260707')."}
 
     if not image_path:
-        if not electrode_code:
-            return {"status": "error", "message": "Provide either image_path or electrode_code."}
+        if not electrode_code or not image_dir:
+            return {
+                "status": "error",
+                "message": (
+                    "Provide either image_path, or both electrode_code and image_dir/batch. "
+                    "image_dir/batch may be omitted only when using image_path directly -- the "
+                    "comparison then auto-pools every batch/sheet sharing that photo's recorded "
+                    "carbon ink formula, instead of just one batch's average."
+                ),
+            }
         image_path, used_code, _ = _resolve_electrode_image(electrode_code, image_dir)
         if image_path is None:
             return {"status": "error", "message": f"No grid-labeled photos found for '{electrode_code}' in {image_dir}."}
@@ -235,46 +308,77 @@ def compare_to_batch_reference(
         parsed = _parse_filename_identity(Path(image_path).stem)
         sheet = parsed[0] if parsed else None
 
-    if sheet is None:
-        # Filename didn't encode a sheet -- e.g. a researcher's own upload
-        # with a generic name, not one of the batch's own cataloged files.
-        # If the batch only has one sheet there's no real ambiguity, so use
-        # it rather than erroring; only ask for sheet explicitly when the
-        # batch genuinely has more than one and we can't tell which.
-        available_sheets = sorted({s for s in (_split_key(k)[0] for k in _index_grid_images(image_dir)) if s is not None})
-        if len(available_sheets) == 1:
-            sheet = available_sheets[0]
-        elif len(available_sheets) > 1:
+    pooled_by_ink = not image_dir
+    reference_scope = {}
+
+    if pooled_by_ink:
+        target_batch = extract_batch_date(Path(image_path).stem)
+        meta = get_batch_metadata(target_batch, sheet)
+        carbon_ink = (meta.get("metadata") or {}).get("carbon_ink_formula") if meta.get("status") == "ok" else None
+        if not carbon_ink:
             return {
                 "status": "error",
                 "message": (
-                    f"Can't tell which sheet to compare against in {image_dir} (found {available_sheets}) "
-                    "-- the image's filename doesn't encode one. Pass sheet explicitly."
+                    f"No image_dir/batch given, and no carbon ink formula is recorded for batch "
+                    f"'{target_batch}'" + (f" sheet '{sheet}'" if sheet else "") + " (via "
+                    "set_batch_metadata) -- can't auto-pool a reference by ink formula. Record "
+                    "the formula first, or pass image_dir/batch to compare against one batch's "
+                    "own average instead."
                 ),
             }
+        matches = _find_sheets_by_carbon_ink(carbon_ink)
+        if not matches:
+            return {
+                "status": "error",
+                "message": f"No batch/sheet on record uses carbon ink formula '{carbon_ink}' -- not even {target_batch}'s own (check set_batch_metadata).",
+            }
+        sources = [(f"reference_images/{b}", s) for b, s in matches]
+        cache_dir = _ink_cache_dir(carbon_ink)
+        reference_scope = {"mode": "carbon_ink_formula", "carbon_ink_formula": carbon_ink, "batches_sheets": matches}
+    else:
+        if sheet is None:
+            # Filename didn't encode a sheet -- e.g. a researcher's own upload
+            # with a generic name, not one of the batch's own cataloged files.
+            # If the batch only has one sheet there's no real ambiguity, so use
+            # it rather than erroring; only ask for sheet explicitly when the
+            # batch genuinely has more than one and we can't tell which.
+            available_sheets = sorted({s for s in (_split_key(k)[0] for k in _index_grid_images(image_dir)) if s is not None})
+            if len(available_sheets) == 1:
+                sheet = available_sheets[0]
+            elif len(available_sheets) > 1:
+                return {
+                    "status": "error",
+                    "message": (
+                        f"Can't tell which sheet to compare against in {image_dir} (found {available_sheets}) "
+                        "-- the image's filename doesn't encode one. Pass sheet explicitly."
+                    ),
+                }
+        sources = [(image_dir, sheet)]
+        cache_dir = _batch_cache_dir(image_dir, sheet)
+        reference_scope = {"mode": "single_batch", "image_dir": image_dir, "sheet": sheet}
 
-    reference = build_batch_reference(image_dir, sheet, crop_box, force_rebuild)
+    reference = build_batch_reference(sources, cache_dir, crop_box, force_rebuild)
     if "error" in reference:
         return {"status": "error", "message": reference["error"]}
     mean_img, align_reference, batch_scores = reference["mean"], reference["align_reference"], reference["scores"]
 
     target_raw = _luminance_grid(image_path, GRID_SIZE, True, 1.0, crop_box)
-    target = _trim_margin(_align(target_raw, align_reference))  # same registration as the batch average
+    target = _trim_margin(_align(target_raw, align_reference))  # same registration as the reference average
     ssim_score, ssim_map = structural_similarity(target, mean_img, data_range=255, full=True)
 
     ranked = sorted(batch_scores.values())
     percentile = float(np.searchsorted(ranked, ssim_score) / len(ranked) * 100)
 
-    diff_path = _batch_cache_dir(image_dir, sheet) / f"{Path(image_path).stem}_diff.png"
+    diff_path = cache_dir / f"{Path(image_path).stem}_diff.png"
     fig, axes = plt.subplots(1, 3, figsize=(13, 4.5))
     axes[0].imshow(target, cmap="viridis"); axes[0].set_title("this electrode")
-    axes[1].imshow(mean_img, cmap="viridis"); axes[1].set_title(f"batch average (n={len(batch_scores)})")
+    axes[1].imshow(mean_img, cmap="viridis"); axes[1].set_title(f"reference average (n={len(batch_scores)})")
     im = axes[2].imshow(1 - ssim_map, cmap="inferno", vmin=0, vmax=1)
     axes[2].set_title("dissimilarity (bright = deviates)")
     fig.colorbar(im, ax=axes[2], fraction=0.046)
     for ax in axes:
         ax.set_xticks([]); ax.set_yticks([])
-    fig.suptitle(f"{Path(image_path).name} -- SSIM={ssim_score:.3f} (percentile {percentile:.0f} within batch)")
+    fig.suptitle(f"{Path(image_path).name} -- SSIM={ssim_score:.3f} (percentile {percentile:.0f} within reference pool)")
     diff_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(diff_path, dpi=120)
     plt.close(fig)
@@ -283,14 +387,19 @@ def compare_to_batch_reference(
     if percentile < 15:
         flags.append(
             f"OUTLIER: SSIM={ssim_score:.3f} puts this electrode in the bottom {percentile:.0f}% of the "
-            f"batch by similarity to the average print -- worth a manual look."
+            f"reference pool by similarity to the average print -- worth a manual look."
+        )
+    if reference.get("missing_sources"):
+        flags.append(
+            f"{len(reference['missing_sources'])} recorded batch/sheet(s) sharing this ink formula had no "
+            f"photos on disk and were skipped: {reference['missing_sources']}."
         )
 
     status = "warn" if flags else "pass"
 
     try:
         note_code = (electrode_code or extract_grid_code(Path(image_path).stem) or "").upper()
-        note_batch = extract_batch_date(Path(image_dir).name)
+        note_batch = extract_batch_date(Path(image_path).stem) if pooled_by_ink else extract_batch_date(Path(image_dir).name)
         if note_code:
             append_qc_result(
                 note_batch, note_code, tool="compare_to_batch_reference", status=status,
@@ -303,6 +412,7 @@ def compare_to_batch_reference(
     return {
         "status": status,
         "electrode_code": electrode_code or None,
+        "reference_scope": reference_scope,
         "diff_plot_path": str(diff_path),
         "metrics": {
             "ssim_vs_batch_average": ssim_score,

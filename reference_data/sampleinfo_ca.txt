@@ -1,0 +1,219 @@
+20260624_sample 3
+electrode batch no.: 20260623_BLISS_1
+Chn1: glucose
+Chn2: lactate
+Chn3: cholesterol
+
+5 points calibration
+
+(glu/lac/chol)Timing (s)
+
+pt 1 (0.5mM/50mM/10mM) 1100, 1102, 1104
+
+pt 2 (1mM/50mM/20mM) 1300, 1302, 1303
+
+pt 3 (3mM/100mM/20mM) 1500, 1502, 1502
+
+pt 4 (5mM/100mM/40mM 1709, 1710, 1711
+
+pt 5 (10mM/200mM/40mM) 1912, 1914, 1916
+
+stop 2100
+
+===================================================
+Experiment date: 03/07/26
+
+Experiment No.: Sample 1
+
+Experiment Type: CV pretreatment simult test
+
+Electrode ID: 20260623_BLISS_1_1A2
+
+5 points calibration
+
+(glu/lac/chol)Timing (s)
+
+pt 1 (0.5mM/50mM/10mM) 807, 809, 810
+
+pt 2 (1mM/50mM/20mM) 1000, 1002, 1003
+
+pt 3 (3mM/100mM/20mM) 1202, 1204, 1205
+
+pt 4 (5mM/100mM/40mM 1401, 1403, 1404
+
+pt 5 (10mM/200mM/40mM) 1604, 1606, 1606
+
+stop 1800
+
+=============================================
+Experiment date: 03/07/26
+
+Experiment No.: Sample 2
+
+Experiment Type: CA 0.5 pretreatment simult test
+
+Electrode ID: 20260623_BLISS_1_1A3
+
+5 points calibration
+
+(glu/lac/chol)Timing (s)
+
+pt 1 (0.5mM/50mM/10mM) 800, 802, 803
+
+pt 2 (1mM/50mM/20mM) 1000, 1002, 1002
+
+pt 3 (3mM/100mM/20mM) 1200, 1202, 1203
+
+pt 4 (5mM/100mM/40mM 1400, 1401, 1402
+
+pt 5 (10mM/200mM/40mM) 1602, 1603, 1604
+
+stop 1800
+==================================================
+Experiment date: 03/07/26
+
+Experiment No.: Sample 3
+
+Experiment Type: CA 0 pretreatment simult test
+
+Electrode ID: 20260623_BLISS_1_1A4
+
+5 points calibration
+
+(glu/lac/chol)Timing (s)
+pt 1 (0.5mM/50mM/10mM) 811, 813, 814
+
+pt 2 (1mM/50mM/20mM) 1000, 1002, 1003
+
+pt 3 (3mM/100mM/20mM) 1200, 1202, 1204
+
+pt 4 (5mM/100mM/40mM 1404, 1406, 1408
+
+pt 5 (10mM/200mM/40mM) 1602, 1604, 1605
+
+stop 1800
+==============================================
+Experiment date: 03/07/26
+
+Experiment No.: Sample 4
+
+Experiment Type: CA -05 pretreatment simult test
+
+Electrode ID: 20260623_BLISS_1_1A1
+5 points calibration
+
+(glu/lac/chol)Timing (s)
+
+pt 1 (0.5mM/50mM/10mM) 801, 803, 804
+
+pt 2 (1mM/50mM/20mM) 1009, 1011, 1012
+
+pt 3 (3mM/100mM/20mM) 1200, 1202, 1202
+
+pt 4 (5mM/100mM/40mM 1400, 1401, 1402
+
+pt 5 (10mM/200mM/40mM) 1602, 1604, 1605
+
+stop 1800
+========================================================
+Experiment date: 08/07/26
+
+Experiment No.: Sample 3
+
+Experiment Type: BLISS simult test
+
+Electrode ID: 20260707_BLISS_1_1D8
+
+5 points calibration
+
+(glu/lac/chol)Timing (s)
+
+pt 1 (0.5mM/50mM/10mM) 1101, 1103, 1104
+
+pt 2 (1mM/50mM/20mM) 1301, 1302, 1302
+
+pt 3 (3mM/100mM/20mM) 1500, 1502, 1502
+
+pt 4 (5mM/100mM/40mM 1724, 1726, 1726
+
+pt 5 (10mM/200mM/40mM) 1903, 1903, 1904
+
+stop 2100
+==============================================
+Experiment date: 09/07/26
+
+Experiment No.: Sample 1
+
+Experiment Type: BLISS simult test
+
+Electrode ID: 20260707_BLISS_2_2F8
+
+5 points calibration
+
+(glu/lac/chol)Timing (s)
+
+pt 1 (0.5mM/50mM/10mM) 1100, 1102, 1103
+
+pt 2 (1mM/50mM/20mM) 1300, 1302, 1303
+
+pt 3 (3mM/100mM/20mM) 1501, 1502, 1503
+
+pt 4 (5mM/100mM/40mM 1700, 1702, 1703
+
+pt 5 (10mM/200mM/40mM) 1900, 1902, 1903
+
+stop 2100
+
+=============================================
+
+Experiment date: 09/07/26
+
+Experiment No.: Sample 2
+
+Experiment Type: BLISS simult test
+
+Electrode ID: 20260707_BLISS_1_1E5
+
+5 points calibration
+
+(glu/lac/chol)Timing (s)
+
+pt 1 (0.5mM/50mM/10mM) 1100, 1102, 1103
+
+pt 2 (1mM/50mM/20mM) 1303, 1305, 1306
+
+pt 3 (3mM/100mM/20mM) 1501, 1502, 1504
+
+pt 4 (5mM/100mM/40mM 1700, 1702, 1704
+
+pt 5 (10mM/200mM/40mM) 1900, 1902, 1904
+
+stop 2100
+==================================================
+Experiment date: 10/07/26
+
+Experiment No.: Sample 1
+
+Experiment Type: BLISS simult test
+
+Electrode ID: 20260707_BLISS_2_2E2
+
+
+5 points calibration
+
+(glu/lac/chol)Timing (s)
+
+pt 1 (0.5mM/50mM/10mM) 1101, 1102, 1104
+
+pt 2 (1mM/50mM/20mM) 1300, 1302, 1303
+
+pt 3 (3mM/100mM/20mM) 1500, 1502, 1504
+
+pt 4 (5mM/100mM/40mM 1706, 1708, 1710
+
+pt 5 (10mM/200mM/40mM) 1900, 1902, 1903
+
+stop 2100
+=============================================
+
+

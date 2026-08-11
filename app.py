@@ -142,7 +142,10 @@ def _stream_turn(contents: list, collected_images: list) -> str:
             _render_tool_call(call_display, result_str, collected_images)
             response_parts.append(types.Part.from_function_response(name=fc.name, response=result))
 
-        contents.append(types.Content(role="tool", parts=response_parts))
+        # The API only accepts "user"/"model" roles -- function responses
+        # ride back as a "user" turn, distinguished from real user input by
+        # containing function_response parts instead of text.
+        contents.append(types.Content(role="user", parts=response_parts))
 
 
 if "contents" not in st.session_state:
@@ -190,7 +193,7 @@ st.title("\U0001f52c SenseOne")
 st.caption("Gemini-backed research assistant for the electrochemical biosensor lab.")
 
 for i, content in enumerate(st.session_state.contents):
-    if content.role == "user":
+    if content.role == "user" and not any(getattr(p, "function_response", None) for p in content.parts):
         with st.chat_message("user"):
             st.markdown("".join(p.text for p in content.parts if p.text))
     elif content.role == "model" and not any(getattr(p, "function_call", None) for p in content.parts):

@@ -6,14 +6,17 @@ directly (image_qc.py, literature_figures.py, vault_maintenance.py).
 
 import os
 
+from dotenv import load_dotenv
 from google import genai
+
+load_dotenv()
 
 # One model for everything (text tool-calling, thinking, and vision) --
 # unlike the local Ollama version, which needed a separate vision model.
 # Check https://ai.google.dev/gemini-api/docs/models for the current
 # recommended free-tier flash model if this one has been deprecated by the
 # time you're reading this -- model names/tiers here move fast.
-MODEL = "gemini-2.5-flash"
+MODEL = "gemini-3.6-flash"
 
 _client = None
 

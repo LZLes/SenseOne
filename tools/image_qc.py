@@ -133,10 +133,14 @@ IMAGE_QC_SCHEMA = {
                     "items": {"type": "number"},
                     "description": (
                         "[left, top, right, bottom] as fractions 0-1 of the image, cropping "
-                        "before the height map is built. Defaults to a box tuned for this "
-                        "camera rig's framing (reference_images/20260707) that "
-                        "excludes background, contact pads, and a glare streak -- pass "
-                        "[0,0,1,1] for the full frame, or your own box for a differently "
+                        "before the height map is built. Defaults to WORKING_ELECTRODE_CROP_BOX, "
+                        "which isolates just the working electrode's central disc (roughness "
+                        "should describe that surface specifically, not the counter-electrode "
+                        "ring/leads around it) -- tuned for the current single-electrode-per-photo "
+                        "framing (reference_images/20260804 on). For a 20260707-style 2x2-cluster "
+                        "photo, don't pass this -- use predict_electrode_performance's sub_position "
+                        "instead, which selects the right sub-electrode's disc automatically. Pass "
+                        "[0,0,1,1] for the full, un-cropped frame, or your own box for a differently "
                         "framed batch."
                     ),
                 },
@@ -295,6 +299,23 @@ def _enhance_contrast(arr: np.ndarray, saturate_pct: float) -> np.ndarray:
 # override crop_box if a future batch is shot at a different zoom/position.
 DEFAULT_CROP_BOX = (0.32, 0.20, 0.78, 0.82)
 
+# Working-electrode-only crop (the central carbon disc, excluding the
+# surrounding counter-electrode ring, reference pad, and lead traces) --
+# roughness should describe the working electrode specifically, since that's
+# the surface that actually does the electrochemistry; the ring/leads are
+# print quality of a different, less relevant feature. Located by circle
+# detection (connected-component/Hough, not eyeballed) against real photos
+# from each format:
+#   - New format (20260804 on, single electrode filling ~the whole frame):
+#     WORKING_ELECTRODE_CROP_BOX, confirmed centered on the disc in
+#     20260804-S3-A1/A5 and 20260805-S1-A1.
+#   - Old format (20260707, 2x2 cluster of 4 sub-electrodes per photo): see
+#     sub_pad_working_electrode_crop_box, which insets further into whichever
+#     quadrant sub_pad_crop_box already isolates.
+# Same camera-rig caveat as DEFAULT_CROP_BOX -- re-tune if a future batch is
+# shot at a different zoom/position.
+WORKING_ELECTRODE_CROP_BOX = (0.31, 0.34, 0.69, 0.77)
+
 # A single 20260707-style photo shows a 2x2 cluster of (up to) 4 distinct
 # physical electrodes, not one -- confirmed against real photos: positions
 # 1/2/3 (matching the CV filename suffix, e.g. "707-A5-1.csv") are
@@ -317,6 +338,29 @@ def sub_pad_crop_box(position: str, base_crop_box=DEFAULT_CROP_BOX):
         "2": (mx, top, right, my),
         "3": (left, my, mx, bottom),
     }[position]
+
+
+# Relative inset (as a fraction of a sub-pad quadrant, i.e. sub_pad_crop_box's
+# output) isolating the working-electrode disc within it -- located via Hough
+# circle detection against 20260707_A1.bmp's position "1" quadrant, then
+# shrunk further inward (radius x0.85) to stay clear of the surrounding
+# counter-electrode ring, which sits close enough to touch the disc in this
+# format (unlike the newer format's photos, which have a visible gap).
+_SUB_PAD_WORKING_ELECTRODE_CENTER = (0.51, 0.53)
+_SUB_PAD_WORKING_ELECTRODE_RADIUS = (0.15, 0.145)
+
+
+def sub_pad_working_electrode_crop_box(position: str, base_crop_box=DEFAULT_CROP_BOX):
+    """Working-electrode-only crop for a 20260707-style photo: sub_pad_crop_box's
+    quadrant, inset further to just the central disc. See the module-level
+    WORKING_ELECTRODE_CROP_BOX note for why roughness should isolate this
+    rather than the whole sub-electrode print (ring + disc + leads).
+    """
+    left, top, right, bottom = sub_pad_crop_box(position, base_crop_box)
+    sw, sh = right - left, bottom - top
+    cx, cy = _SUB_PAD_WORKING_ELECTRODE_CENTER
+    rx, ry = _SUB_PAD_WORKING_ELECTRODE_RADIUS
+    return (left + (cx - rx) * sw, top + (cy - ry) * sh, left + (cx + rx) * sw, top + (cy + ry) * sh)
 
 
 def _luminance_grid(
@@ -418,10 +462,11 @@ def analyze_surface_topology(
     max_luminance_cv: float = 0.25,
     enhance_contrast: bool = True,
     contrast_saturate_pct: float = 1.0,
-    crop_box=DEFAULT_CROP_BOX,
+    crop_box=WORKING_ELECTRODE_CROP_BOX,
 ) -> dict:
     """ImageJ-style surface plot: pixel luminance (8-bit, contrast-enhanced,
-    cropped to just the electrode print) treated as height. Renders the 3D
+    cropped to just the working electrode's disc -- not the counter-electrode
+    ring, reference pad, or lead traces) treated as height. Renders the 3D
     surface and reports roughness metrics -- an evenly-inked print should
     read as fairly flat; texture/streaking/isolated spikes (missed ink,
     contamination, glare) inflate the variance.
@@ -430,9 +475,9 @@ def analyze_surface_topology(
       - Luminance responds to lighting/glare as much as to the print itself,
         so uneven lighting across shots will read as "roughness" too --
         this is only meaningful for photos taken under consistent lighting.
-        crop_box (default DEFAULT_CROP_BOX) excludes an obvious glare streak
-        specific to this camera rig, but won't help with glare that falls
-        inside the cropped region on a different shot.
+        crop_box (default WORKING_ELECTRODE_CROP_BOX) isolates the working
+        electrode's disc, but won't help with glare that falls inside that
+        cropped region on a given shot.
       - max_luminance_cv is a weak signal, confirmed empirically, not just
         suspected: across a real 48-electrode batch, luminance_cv ranged
         only 0.609-0.660 (essentially no spread) while every single
@@ -446,9 +491,12 @@ def analyze_surface_topology(
         differentiated 8/48 (17%) and correctly caught the electrodes
         independently confirmed to have real electrical failures. Treat
         this flag as a rough, secondary descriptive note at best.
-      - crop_box is tuned for this batch's framing (reference_images/20260707).
-        Pass crop_box=None for the full frame, or your own (left, top,
-        right, bottom) fractions, if a future batch is shot differently.
+      - WORKING_ELECTRODE_CROP_BOX is tuned for the current single-electrode-
+        per-photo framing (reference_images/20260804 on). For a 20260707-style
+        2x2-cluster photo, pass sub_pad_working_electrode_crop_box(position)
+        instead to isolate one sub-electrode's disc. Pass crop_box=None for
+        the full, un-cropped frame, or your own (left, top, right, bottom)
+        fractions, if a future batch is shot differently.
       - The "roughness" metrics (Ra/Rq/Rz/Rt/Rsk/Rku) are the standard
         ISO-4287 formulas, but computed on luminance (0-255), not physical
         height (nm/um) -- there's no calibration from pixel brightness to
@@ -573,7 +621,7 @@ def qc_sensor_image(
         surface = analyze_surface_topology(
             image_path, surface_grid_size, max_luminance_cv,
             surface_enhance_contrast, surface_contrast_saturate_pct,
-            tuple(surface_crop_box) if surface_crop_box else DEFAULT_CROP_BOX,
+            tuple(surface_crop_box) if surface_crop_box else WORKING_ELECTRODE_CROP_BOX,
         )
         parsed["surface_analysis"] = surface
         rank = {"pass": 0, "warn": 1, "fail": 2}

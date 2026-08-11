@@ -28,7 +28,10 @@ predict_electrode_performance starts using it automatically.
 from scipy.stats import pearsonr
 
 from tools.electrode_notes import NOTES_DIR, DIGEST_FILENAME, BATCH_INFO_FILENAME, _load_note
-from tools.image_qc import DEFAULT_CROP_BOX, analyze_surface_topology, sub_pad_crop_box, _resolve_electrode_image
+from tools.image_qc import (
+    WORKING_ELECTRODE_CROP_BOX, analyze_surface_topology, sub_pad_working_electrode_crop_box,
+    _resolve_electrode_image,
+)
 
 _VISUAL_FIELDS = ("Ra", "Rq", "Rz", "Rt", "Rsk", "Rku")
 # From sensor_qc (single-scan snapshot) and analyze_cv_stability (scan-to-scan
@@ -250,7 +253,10 @@ def predict_electrode_performance(
         if image_path is None:
             return {"status": "error", "message": f"No grid-labeled photos found for '{electrode_code}' in {image_dir}."}
 
-    effective_crop = sub_pad_crop_box(sub_position) if sub_position else (tuple(crop_box) if crop_box else DEFAULT_CROP_BOX)
+    effective_crop = (
+        sub_pad_working_electrode_crop_box(sub_position) if sub_position
+        else (tuple(crop_box) if crop_box else WORKING_ELECTRODE_CROP_BOX)
+    )
 
     surface = analyze_surface_topology(image_path, crop_box=effective_crop)
     if surface.get("status") == "error":

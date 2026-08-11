@@ -3,7 +3,7 @@ SenseOne (Gemini fork)
 ----------------------
 Same tool-calling agent as the local Ollama version, ported to Google's
 Gemini API so it can run as a hosted demo without a local model. One
-Gemini model (gemini-2.5-flash) replaces both qwen3:8b (tool-calling/
+Gemini model (see tools/_gemini.py's MODEL) replaces both qwen3:8b (tool-calling/
 thinking) and qwen2.5vl:7b (vision) -- Gemini is natively multimodal, so
 image_qc.py and literature_figures.py's vision calls use the same model
 and client as this file, via tools/_gemini.py.
@@ -83,13 +83,21 @@ biosensor lab. You help the researcher:
      spec. Mention plainly that the CV flagging threshold
      is an unvalidated starting point and that lighting differences between
      shots affect it as much as real surface texture does. surface_crop_box
-     (and compare_to_batch_reference's crop_box) default to a box tuned
-     specifically for the original 20260707 batch's framing -- confirmed
-     wrong for later batches (20260804, 20260805), which are shot as a
-     single electrode filling nearly the whole frame with minimal
-     background. For any batch other than 20260707, pass crop_box=[0,0,1,1]
-     (full frame) unless the researcher says otherwise; don't assume the
-     default is right just because it worked before on different photos.
+     defaults to WORKING_ELECTRODE_CROP_BOX, isolating just the working
+     electrode's central disc (not the counter-electrode ring, reference
+     pad, or lead traces) -- roughness should describe that surface
+     specifically, since it's the one that actually does the
+     electrochemistry. That default is tuned for the current
+     single-electrode-per-photo framing (20260804, 20260805); don't override
+     it unless the researcher wants the full print instead. For a
+     20260707-style photo (2x2 cluster of 4 sub-electrodes per photo), don't
+     pass surface_crop_box at all -- use predict_electrode_performance with
+     sub_position instead, which selects the right sub-electrode's disc
+     automatically. compare_to_batch_reference's crop_box is separate and
+     still defaults to the whole-print box tuned for 20260707's framing --
+     confirmed wrong for later batches, so pass crop_box=[0,0,1,1] (full
+     frame) there for any batch other than 20260707 unless the researcher
+     says otherwise.
      Also: batches with more than one sheet (e.g. 20260805 has S1 and S3
      mixed in one directory) need electrode_code in "<sheet>-<code>" form,
      e.g. "S3-A1" -- a bare "A1" is ambiguous there and the tool will
@@ -333,7 +341,10 @@ def run_hops(contents: list) -> list:
             print(f"  [tool] {fc.name}({args})")
             result = run_tool_call(fc.name, args)
             response_parts.append(types.Part.from_function_response(name=fc.name, response=result))
-        contents.append(types.Content(role="tool", parts=response_parts))
+        # The API only accepts "user"/"model" roles -- function responses
+        # ride back as a "user" turn, distinguished from real user input by
+        # containing function_response parts instead of text.
+        contents.append(types.Content(role="user", parts=response_parts))
 
 
 def _collect_cited_papers(contents, since_index) -> set:
@@ -345,8 +356,6 @@ def _collect_cited_papers(contents, since_index) -> set:
     """
     paper_ids = set()
     for c in contents[since_index:]:
-        if c.role != "tool":
-            continue
         for part in c.parts or []:
             fr = getattr(part, "function_response", None)
             if fr is None or fr.name not in _LITERATURE_TOOL_NAMES:
