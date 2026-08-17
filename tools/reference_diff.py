@@ -50,6 +50,7 @@ import numpy as np
 from scipy.ndimage import shift as nd_shift
 from skimage.metrics import structural_similarity
 from skimage.registration import phase_cross_correlation
+from skimage.transform import resize as sk_resize
 
 from tools.electrode_notes import (
     BATCH_INFO_FILENAME, NOTES_DIR, _load_note, append_qc_result, extract_batch_date,
@@ -57,7 +58,7 @@ from tools.electrode_notes import (
 )
 from tools.image_qc import (
     DEFAULT_CROP_BOX, _index_grid_images, _luminance_grid, _parse_filename_identity,
-    _resolve_electrode_image, _split_key,
+    _resolve_electrode_image, _split_key, _validate_image_file,
 )
 
 REFERENCE_DIFF_DIR = Path("reference_diff")
@@ -65,7 +66,24 @@ GRID_SIZE = 150  # finer than image_qc's 3D-plot grid; no mesh-rendering cost to
 ALIGN_MARGIN_FRAC = 0.10  # trimmed off all sides post-alignment to drop shift-induced edge artifacts
 
 
+def _match_shape(grid: np.ndarray, target_shape: tuple) -> np.ndarray:
+    """Resize grid to target_shape if it doesn't already match.
+
+    _luminance_grid derives each image's grid height from its own aspect
+    ratio (grid_size fixed, height computed from w/h), so two photos shot on
+    a different camera/rig -- e.g. a researcher's own uploaded photo being
+    compared against a batch shot differently, an explicitly supported use
+    case -- can produce differently-shaped grids. phase_cross_correlation
+    and np.mean/structural_similarity all require matching shapes, so
+    without this a mismatched pair crashes instead of comparing.
+    """
+    if grid.shape == target_shape:
+        return grid
+    return sk_resize(grid, target_shape, preserve_range=True, anti_aliasing=True)
+
+
 def _align(grid: np.ndarray, reference: np.ndarray) -> np.ndarray:
+    grid = _match_shape(grid, reference.shape)
     shift_yx = phase_cross_correlation(reference, grid, upsample_factor=10)[0]
     return nd_shift(grid, shift_yx, mode="nearest")
 
@@ -357,12 +375,22 @@ def compare_to_batch_reference(
         cache_dir = _batch_cache_dir(image_dir, sheet)
         reference_scope = {"mode": "single_batch", "image_dir": image_dir, "sheet": sheet}
 
-    reference = build_batch_reference(sources, cache_dir, crop_box, force_rebuild)
+    error = _validate_image_file(image_path)
+    if error:
+        return {"status": "error", "message": error}
+
+    try:
+        reference = build_batch_reference(sources, cache_dir, crop_box, force_rebuild)
+    except ValueError as e:
+        return {"status": "error", "message": str(e)}
     if "error" in reference:
         return {"status": "error", "message": reference["error"]}
     mean_img, align_reference, batch_scores = reference["mean"], reference["align_reference"], reference["scores"]
 
-    target_raw = _luminance_grid(image_path, GRID_SIZE, True, 1.0, crop_box)
+    try:
+        target_raw = _luminance_grid(image_path, GRID_SIZE, True, 1.0, crop_box)
+    except ValueError as e:
+        return {"status": "error", "message": str(e)}
     target = _trim_margin(_align(target_raw, align_reference))  # same registration as the reference average
     ssim_score, ssim_map = structural_similarity(target, mean_img, data_range=255, full=True)
 

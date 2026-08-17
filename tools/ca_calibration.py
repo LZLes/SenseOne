@@ -91,6 +91,8 @@ _STOP_RE = re.compile(r"stop\s+([\d.]+)", re.IGNORECASE)
 
 
 def _parse_sampleinfo(path):
+    if not Path(path).is_file():
+        raise FileNotFoundError(f"Sampleinfo file not found: {path}")
     text = open(path, "r", encoding="utf-8", errors="replace").read()
     blocks = re.split(r"\n=+\n", text)
 
@@ -161,9 +163,15 @@ def analyze_ca_calibration(
     stop_s: float = None,
     saturation_threshold: float = 0.5,
 ) -> dict:
+    if not Path(csv_path).is_file():
+        return {"status": "error", "message": f"File not found: {csv_path}"}
+
     protocol_meta = {}
     if concentrations_mM is None or timings_s is None:
-        protocol = _lookup_protocol(csv_path, sampleinfo_path)
+        try:
+            protocol = _lookup_protocol(csv_path, sampleinfo_path)
+        except FileNotFoundError as e:
+            return {"status": "error", "message": str(e)}
         if protocol is None:
             return {
                 "status": "error",
@@ -225,6 +233,13 @@ def analyze_ca_calibration(
 
     x = np.array([p["concentration_mM"] for p in calibration_points])
     y = np.array([p["response_a"] for p in calibration_points])
+
+    if len(set(x.tolist())) < 2:
+        return {
+            "status": "error",
+            "message": "All calibration points share the same concentration -- can't fit a calibration "
+                       "curve (need at least 2 distinct concentrations).",
+        }
 
     slope, intercept = np.polyfit(x, y, 1)
     y_fit = slope * x + intercept

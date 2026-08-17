@@ -27,13 +27,49 @@ and a photo of the same physical electrode land in one note instead of three.
 
 import json
 import re
+import threading
+import time
 from datetime import date
 from pathlib import Path
+
+from tools._paths import safe_path_component as _sanitize_path_token
 
 NOTES_DIR = Path("electrode_notes")
 _GRID_CODE_RE = re.compile(r"([A-Za-z])(\d+)$")
 _SHEET_CODE_RE = re.compile(r"-([A-Za-z]\d+)-([A-Za-z]\d+)$")  # e.g. "...-S3-A1" -> sheet="S3", code="A1"
 _BATCH_DATE_RE = re.compile(r"^(\d{8})")
+
+
+# In-process locks, keyed by note path, serializing the read-modify-write
+# cycle every note/metadata write goes through. Streamlit runs one process
+# with each visitor's session on its own thread, so this is enough to stop
+# two concurrent QC calls against the same electrode from racing and one
+# silently clobbering the other's just-written history (confirmed possible:
+# both read the same file, both append, whichever writes last wins).
+_write_locks_guard = threading.Lock()
+_write_locks: dict = {}
+
+
+def _lock_for(path: Path) -> threading.Lock:
+    key = str(path)
+    with _write_locks_guard:
+        lock = _write_locks.get(key)
+        if lock is None:
+            lock = _write_locks[key] = threading.Lock()
+        return lock
+
+
+def _backup_corrupt(path: Path) -> None:
+    """A note file that fails to parse (partial write from a race, a bad
+    manual edit) would otherwise get silently replaced by a blank one on the
+    next write, permanently losing its QC history. Move it aside instead so
+    it's recoverable.
+    """
+    try:
+        backup = path.with_name(f"{path.stem}.corrupt-{int(time.time())}{path.suffix}")
+        path.rename(backup)
+    except Exception:
+        pass
 
 GET_ELECTRODE_NOTE_SCHEMA = {
     "type": "function",
@@ -118,7 +154,7 @@ def extract_grid_code(s: str):
 
 
 def note_path(batch: str, electrode_code: str) -> Path:
-    return NOTES_DIR / batch / f"{electrode_code.upper()}.md"
+    return NOTES_DIR / _sanitize_path_token(batch) / f"{_sanitize_path_token(electrode_code.upper())}.md"
 
 
 def _load_note(path: Path):
@@ -138,7 +174,7 @@ def _read_or_init(batch: str, electrode_code: str):
         try:
             return path, *_load_note(path)
         except Exception:
-            pass
+            _backup_corrupt(path)
     meta = {"electrode_id": electrode_code.upper(), "batch": batch, "created": date.today().isoformat()}
     return path, meta, ""
 
@@ -155,20 +191,22 @@ def append_qc_result(
     """Best-effort -- callers should wrap this in try/except so a note-write
     failure never breaks the actual QC result being returned to the user.
     """
-    path, meta, body = _read_or_init(batch, electrode_code)
+    path = note_path(batch, electrode_code)
+    with _lock_for(path):
+        path, meta, body = _read_or_init(batch, electrode_code)
 
-    if file_ref and file_kind:
-        refs = meta.setdefault(file_kind, [])
-        if file_ref not in refs:
-            refs.append(file_ref)
+        if file_ref and file_kind:
+            refs = meta.setdefault(file_kind, [])
+            if file_ref not in refs:
+                refs.append(file_ref)
 
-    history = meta.setdefault("qc_history", [])
-    entry = {"date": date.today().isoformat(), "tool": tool, "status": status}
-    if metrics:
-        entry["metrics"] = metrics
-    history.append(entry)
+        history = meta.setdefault("qc_history", [])
+        entry = {"date": date.today().isoformat(), "tool": tool, "status": status}
+        if metrics:
+            entry["metrics"] = metrics
+        history.append(entry)
 
-    _write_note(path, meta, body)
+        _write_note(path, meta, body)
     try:
         generate_batch_digest(batch)
     except Exception:
@@ -176,10 +214,12 @@ def append_qc_result(
 
 
 def add_electrode_note(batch: str, electrode_code: str, note_text: str) -> dict:
-    path, meta, body = _read_or_init(batch, electrode_code)
-    entry = f"### {date.today().isoformat()}\n{note_text}"
-    body = f"{body}\n\n{entry}" if body else entry
-    _write_note(path, meta, body)
+    path = note_path(batch, electrode_code)
+    with _lock_for(path):
+        path, meta, body = _read_or_init(batch, electrode_code)
+        entry = f"### {date.today().isoformat()}\n{note_text}"
+        body = f"{body}\n\n{entry}" if body else entry
+        _write_note(path, meta, body)
     return {"status": "ok", "note_path": str(path)}
 
 
@@ -246,28 +286,30 @@ _SHEET_METADATA_FIELDS = ("silver_ink_formula", "carbon_ink_formula", "n_passes"
 
 
 def batch_metadata_path(batch: str) -> Path:
-    return NOTES_DIR / batch / BATCH_INFO_FILENAME
+    return NOTES_DIR / _sanitize_path_token(batch) / BATCH_INFO_FILENAME
 
 
 def set_batch_metadata(batch: str, sheet_number: str, **fields) -> dict:
     path = batch_metadata_path(batch)
-    if path.exists():
-        try:
-            meta, body = _load_note(path)
-        except Exception:
+    with _lock_for(path):
+        if path.exists():
+            try:
+                meta, body = _load_note(path)
+            except Exception:
+                _backup_corrupt(path)
+                meta, body = {"batch": batch, "sheets": {}}, ""
+        else:
             meta, body = {"batch": batch, "sheets": {}}, ""
-    else:
-        meta, body = {"batch": batch, "sheets": {}}, ""
-    meta.setdefault("sheets", {})
+        meta.setdefault("sheets", {})
 
-    sheet = meta["sheets"].setdefault(sheet_number, {})
-    for k in _SHEET_METADATA_FIELDS:
-        v = fields.get(k)
-        if v is not None:
-            sheet[k] = v
-    sheet["updated"] = date.today().isoformat()
+        sheet = meta["sheets"].setdefault(sheet_number, {})
+        for k in _SHEET_METADATA_FIELDS:
+            v = fields.get(k)
+            if v is not None:
+                sheet[k] = v
+        sheet["updated"] = date.today().isoformat()
 
-    _write_note(path, meta, body)
+        _write_note(path, meta, body)
     try:
         generate_batch_digest(batch)
     except Exception:
@@ -299,7 +341,7 @@ def generate_batch_digest(batch: str):
     same shared file). Regenerated automatically by append_qc_result.
     Returns the markdown content, or None if the batch has no notes yet.
     """
-    batch_dir = NOTES_DIR / batch
+    batch_dir = NOTES_DIR / _sanitize_path_token(batch)
     if not batch_dir.exists():
         return None
 
@@ -386,7 +428,7 @@ def get_batch_digest(batch: str) -> dict:
 def list_electrode_notes(batch: str = None) -> dict:
     if not NOTES_DIR.exists():
         return {"n_notes": 0, "notes": []}
-    search_dir = (NOTES_DIR / batch) if batch else NOTES_DIR
+    search_dir = (NOTES_DIR / _sanitize_path_token(batch)) if batch else NOTES_DIR
     if not search_dir.exists():
         return {"n_notes": 0, "notes": []}
 

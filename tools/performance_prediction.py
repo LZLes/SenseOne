@@ -219,13 +219,18 @@ def _build_predictions(visual: dict, relationships: list) -> list:
         value = visual.get(rel["visual_feature"])
         if value is None:
             continue
-        direction = "higher" if rel["r"] > 0 else "lower"
+        # For r > 0 the two move together (higher-with-higher or
+        # lower-with-lower); for r < 0 they move oppositely (higher-with-
+        # lower). Describing both sides with the same word regardless of
+        # sign (as an earlier version of this did) states the literal
+        # opposite of a negative correlation's actual meaning.
+        cv_direction = "higher" if rel["r"] > 0 else "lower"
         predictions.append({
             "cv_metric": rel["cv_metric"],
             "based_on": f"{rel['visual_feature']}={value:.2f}",
             "relationship": (
-                f"r={rel['r']:+.2f} (n={rel['n']}, p={rel['p']:.3f}): {direction} "
-                f"{rel['visual_feature']} associates with {direction} {rel['cv_metric']}"
+                f"r={rel['r']:+.2f} (n={rel['n']}, p={rel['p']:.3f}): higher "
+                f"{rel['visual_feature']} associates with {cv_direction} {rel['cv_metric']}"
             ),
         })
     return predictions

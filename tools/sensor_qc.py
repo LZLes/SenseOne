@@ -136,6 +136,9 @@ def qc_electrochemical_data(
     max_noise_ratio: float = 0.10,
     scan_index: int = -1,
 ) -> dict:
+    if not Path(csv_path).is_file():
+        return {"status": "error", "message": f"File not found: {csv_path}"}
+
     potential = current = None
 
     # Attempt 1: clean CSV with named potential/current columns.
@@ -163,6 +166,9 @@ def qc_electrochemical_data(
         idx = max(0, min(idx, n_scans - 1))
         potential = data[:, 2 * idx]
         current = data[:, 2 * idx + 1] * 1e-6  # microamps -> amps
+
+    if potential is None or current is None or len(current) == 0:
+        return {"status": "error", "message": f"No usable data rows found in {csv_path}."}
 
     flags = []
     metrics = {}
@@ -219,9 +225,13 @@ def qc_electrochemical_data(
         else:
             flags.append("Could not identify both anodic and cathodic peaks for delta Ep calculation.")
 
-    status = "fail" if any("LOW SIGNAL" in f or "POOR REVERSIBILITY" in f for f in flags) else (
-        "warn" if flags else "pass"
-    )
+    # "Could not identify..." is fail-level here to match analyze_cv_stability's
+    # severity for the identical condition -- previously it only ranked as
+    # "warn" in this tool, so the same underlying failure (no CV peaks found)
+    # got two different verdicts depending on which tool was called.
+    status = "fail" if any(
+        "LOW SIGNAL" in f or "POOR REVERSIBILITY" in f or f.startswith("Could not identify") for f in flags
+    ) else ("warn" if flags else "pass")
 
     # CA files don't carry a grid code in their filename (only ca_calibration.py's
     # sampleinfo lookup can resolve electrode identity for those) -- only CV

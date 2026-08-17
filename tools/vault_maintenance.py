@@ -19,10 +19,8 @@ This is meant to be called either from the chat agent ("update the vault")
 or run standalone/on a schedule -- it takes no conversation state.
 """
 
-import json
 import re
 from datetime import date
-from pathlib import Path
 
 from google.genai import types
 
@@ -106,19 +104,31 @@ def _all_notes() -> list:
     return notes
 
 
+MAX_QUERIES_PER_REFRESH = 25  # bounds how long one "update the vault" call can block re-hitting PubMed/arXiv live
+
+
 def _refresh_known_queries() -> list:
     seen = set()
     for note in _all_notes():
         for q in note["meta"].get("queries", []):
             seen.add(_normalize_query(q))
 
+    queries = sorted(seen)
+    skipped = queries[MAX_QUERIES_PER_REFRESH:]
+    queries = queries[:MAX_QUERIES_PER_REFRESH]
+
     results = []
-    for query in sorted(seen):
+    for query in queries:
         try:
             r = search_literature(query, refresh=True)
             results.append({"query": query, "n_results": r["n_results"], "errors": r["errors"]})
         except Exception as e:
             results.append({"query": query, "error": str(e)})
+    if skipped:
+        results.append({
+            "query": None,
+            "error": f"{len(skipped)} more known quer(ies) skipped this sweep (cap {MAX_QUERIES_PER_REFRESH}/call).",
+        })
     return results
 
 
@@ -176,12 +186,17 @@ def _generate_insights() -> str:
 
     prompt = _INSIGHTS_PROMPT_TEMPLATE.format(vault_content=vault_content)
 
-    response = client().models.generate_content(
-        model=MODEL,
-        contents=prompt,
-        config=types.GenerateContentConfig(temperature=0.2),
-    )
-    content = response.text.strip()
+    try:
+        response = client().models.generate_content(
+            model=MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(temperature=0.2),
+        )
+        content = (response.text or "").strip()
+    except Exception as e:
+        return f"_Could not generate insights: {e}_"
+    if not content:
+        return "_Insights generation returned an empty response (possibly safety-blocked)._"
 
     # Models sometimes wrap markdown output in a stray ```markdown fence --
     # strip it so INSIGHTS.md renders as markdown, not a literal code block.

@@ -25,6 +25,8 @@ from pathlib import Path
 
 import requests
 
+from tools._paths import safe_path_component as _safe_id_component
+
 VAULT_DIR = Path("literature_vault")
 
 LITERATURE_SCHEMA = {
@@ -182,7 +184,7 @@ def _load_note(path: Path):
 
 def _save_note(paper: dict, query: str):
     VAULT_DIR.mkdir(parents=True, exist_ok=True)
-    path = VAULT_DIR / f"{_paper_id(paper)}.md"
+    path = note_path(_paper_id(paper))
 
     if path.exists():
         try:
@@ -229,7 +231,7 @@ def _search_vault(query: str) -> list:
 
 
 def note_path(paper_id: str) -> Path:
-    return VAULT_DIR / f"{paper_id}.md"
+    return VAULT_DIR / f"{_safe_id_component(paper_id)}.md"
 
 
 def append_figures_section(paper_id: str, figures_md: str):

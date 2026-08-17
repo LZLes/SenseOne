@@ -169,6 +169,9 @@ def analyze_cv_stability(
         if csv_path is None:
             return {"status": "error", "message": f"No CV file found for '{electrode_code}' in {csv_dir}."}
 
+    if not Path(csv_path).is_file():
+        return {"status": "error", "message": f"File not found: {csv_path}"}
+
     data = load_instrument_csv(csv_path)
     if data is None or data.ndim != 2 or data.shape[1] < 2 or data.shape[1] % 2 != 0:
         return {"status": "error", "message": f"Could not find multi-scan CV data in {csv_path}."}

@@ -24,13 +24,13 @@ import io
 import json
 import re
 
-import fitz  # PyMuPDF
+import pymupdf as fitz  # `import fitz` alone is deprecated as of PyMuPDF 1.24+
 import requests
 from google.genai import types
 from PIL import Image
 
 from tools._gemini import client, MODEL
-from tools.literature import VAULT_DIR, _load_note, append_figures_section, note_path
+from tools.literature import VAULT_DIR, _load_note, _safe_id_component, append_figures_section, note_path
 
 FIGURES_DIR = VAULT_DIR / "figures"
 MIN_FIGURE_DIM = 200  # px; filters out logos/icons/decorative marks
@@ -94,6 +94,8 @@ quality_note should be empty string if not applicable (e.g. for schematics)."""
 # missing this the first time caused live 404s during a vault sweep, not just in theory.
 _OLD_STYLE_ARXIV_RE = re.compile(r"^([a-zA-Z\-]+)_(\d.*)$")
 
+MAX_PDF_BYTES = 50 * 1024 * 1024  # a paper's PDF should never legitimately be this large
+
 
 def _reconstruct_arxiv_id(paper_id: str) -> str:
     raw = paper_id[len("arxiv_"):]
@@ -101,12 +103,27 @@ def _reconstruct_arxiv_id(paper_id: str) -> str:
     return f"{m.group(1)}/{m.group(2)}" if m else raw
 
 
+def _fetch_with_size_cap(url: str, timeout: int, max_bytes: int = MAX_PDF_BYTES) -> bytes:
+    """requests.get(...).content loads the whole body into memory before we
+    ever get to inspect its size -- streaming and aborting past max_bytes
+    keeps one oversized/unexpected response from blowing up memory on a
+    resource-constrained hosted instance.
+    """
+    with requests.get(url, timeout=timeout, stream=True) as resp:
+        resp.raise_for_status()
+        chunks = []
+        total = 0
+        for chunk in resp.iter_content(chunk_size=65536):
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValueError(f"Response from {url} exceeded the {max_bytes // (1024 * 1024)} MB size cap.")
+            chunks.append(chunk)
+        return b"".join(chunks)
+
+
 def _download_arxiv_pdf(arxiv_id: str) -> bytes:
     # arxiv_id here is the real arXiv ID, e.g. "2012.05543v1" or "cond-mat/0602636v1"
-    url = f"https://arxiv.org/pdf/{arxiv_id}"
-    resp = requests.get(url, timeout=30)
-    resp.raise_for_status()
-    return resp.content
+    return _fetch_with_size_cap(f"https://arxiv.org/pdf/{arxiv_id}", timeout=30)
 
 
 EUROPEPMC_SEARCH = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
@@ -128,17 +145,19 @@ def _lookup_pmc(pmid: str):
 def _download_pmc_pdf(pmcid: str) -> bytes:
     # Found via a search result's fullTextUrlList, not guessed -- the more
     # "obvious" NCBI endpoint (ptpmcrender.fcgi) doesn't respond at all.
-    resp = requests.get(f"https://europepmc.org/articles/{pmcid}?pdf=render", timeout=30)
-    resp.raise_for_status()
-    if not resp.content.startswith(b"%PDF"):
+    content = _fetch_with_size_cap(f"https://europepmc.org/articles/{pmcid}?pdf=render", timeout=30)
+    if not content.startswith(b"%PDF"):
         raise ValueError(f"Europe PMC did not return a PDF for {pmcid}")
-    return resp.content
+    return content
+
+
+MAX_PAGES_SCANNED = 200  # bounds how long one figure-extraction call can block on an unusually long PDF
 
 
 def _extract_figures(pdf_bytes: bytes, max_figures: int):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     figures = []
-    for page_index in range(len(doc)):
+    for page_index in range(min(len(doc), MAX_PAGES_SCANNED)):
         for img in doc[page_index].get_images(full=True):
             xref = img[0]
             base = doc.extract_image(xref)
@@ -171,15 +190,17 @@ def _downsize_for_captioning(image_bytes: bytes) -> bytes:
 def _caption_figure(image_bytes: bytes, context: str = "") -> dict:
     context_line = f"\nAdditional context: {context}\n" if context else ""
     prompt = _CAPTION_PROMPT_TEMPLATE.format(context_line=context_line)
-    response = client().models.generate_content(
-        model=MODEL,
-        contents=[prompt, types.Part.from_bytes(data=_downsize_for_captioning(image_bytes), mime_type="image/jpeg")],
-        config=types.GenerateContentConfig(response_mime_type="application/json"),
-    )
     try:
+        response = client().models.generate_content(
+            model=MODEL,
+            contents=[prompt, types.Part.from_bytes(data=_downsize_for_captioning(image_bytes), mime_type="image/jpeg")],
+            config=types.GenerateContentConfig(response_mime_type="application/json"),
+        )
         parsed = json.loads(response.text)
     except json.JSONDecodeError:
         parsed = {"figure_type": "other", "description": "(caption failed to parse)", "quality_note": ""}
+    except Exception as e:
+        parsed = {"figure_type": "other", "description": f"(captioning failed: {e})", "quality_note": ""}
     parsed.setdefault("figure_type", "other")
     parsed.setdefault("description", "")
     parsed.setdefault("quality_note", "")
@@ -229,7 +250,7 @@ def analyze_literature_figures(paper_id: str, max_figures: int = 5, context: str
     if not raw_figures:
         return {"status": "warn", "message": "No figures above the size threshold were found.", "figures": []}
 
-    out_dir = FIGURES_DIR / paper_id
+    out_dir = FIGURES_DIR / _safe_id_component(paper_id)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     figures = []

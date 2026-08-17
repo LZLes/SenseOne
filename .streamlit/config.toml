@@ -1,0 +1,13 @@
+# Deployment hardening for Streamlit Community Cloud. See app.py's
+# MAX_UPLOAD_BYTES (kept in sync with maxUploadSize below) for the
+# application-level check -- this is the transport-level backstop.
+
+[server]
+maxUploadSize = 15
+maxMessageSize = 15
+
+[browser]
+gatherUsageStats = false
+
+[client]
+showErrorDetails = true

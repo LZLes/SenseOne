@@ -200,13 +200,31 @@ you> Update the literature vault
   if it can't be tied to a specific paper, it's flagged as the model's
   own inference instead.
 
+## Deploying to Streamlit Community Cloud
+
+Point a new Community Cloud app at this repo/branch, then set the key in
+**App settings → Secrets** as a top-level entry:
+
+```toml
+GEMINI_API_KEY = "..."
+```
+
+Top-level only -- a key nested under a `[section]` won't be found (the app
+checks `os.environ["GEMINI_API_KEY"]` first, then falls back to
+`st.secrets["GEMINI_API_KEY"]`, and Streamlit only mirrors top-level secrets
+into `os.environ`). The sidebar shows a clear error and the chat input is
+disabled until a valid key is set, rather than failing on the first message.
+
 ## Rate limits and cost
 
 Gemini's free tier has requests-per-minute/day quotas that change over
 time -- check [current limits](https://ai.google.dev/gemini-api/docs/rate-limits)
 before a demo with several simultaneous users. Every visitor's usage
 draws on whichever `GEMINI_API_KEY` the app is running with, not
-their own -- there's no per-user key handling here.
+their own -- there's no per-user key handling here. Calls are retried
+automatically on transient/rate-limit errors (see `tools/_gemini.py`),
+and each chat turn is capped at `agent.MAX_HOPS` tool-call round-trips so
+a confused model can't loop indefinitely and burn through the shared quota.
 
 ## Project layout
 

@@ -25,7 +25,6 @@ complement, not replace, the vision model's defect read.
 """
 
 import json
-import os
 import re
 from pathlib import Path
 
@@ -275,6 +274,47 @@ def _resolve_electrode_image(electrode_code: str, image_dir: str):
     return str(candidates[0]), nearest_key, distance
 
 
+def _validate_image_file(image_path: str):
+    """Returns an error message string if image_path isn't a readable,
+    decodable image file, else None. Guards against directories (raise
+    IsADirectoryError otherwise), and against corrupted or mistyped files --
+    without this, raw bytes from any file at this path get read and
+    forwarded to the Gemini API as if they were valid image data, which
+    either fails deep inside the vision call with a confusing error, or (for
+    a file that just happens to *look* image-adjacent) silently sends
+    garbage as a "photo".
+    """
+    path = Path(image_path)
+    if not path.is_file():
+        return f"Image not found: {image_path}"
+    try:
+        with Image.open(path) as img:
+            img.verify()
+    except Exception as e:
+        return f"'{image_path}' is not a readable image file: {e}"
+    return None
+
+
+def _validate_crop_box(crop_box):
+    """Returns a clamped-to-[0,1] (left, top, right, bottom) tuple, or raises
+    ValueError. crop_box is an LLM-suppliable argument on several tools --
+    without bounds/ordering checks, a reversed or out-of-range box silently
+    produces a zero-width/height crop, which then either crashes deeper in
+    numpy/PIL or (worse) produces nan-poisoned "roughness" numbers that get
+    reported back as if they were valid.
+    """
+    if crop_box is None:
+        return None
+    try:
+        left, top, right, bottom = (float(v) for v in crop_box)
+    except (TypeError, ValueError):
+        raise ValueError(f"crop_box must be 4 numbers [left, top, right, bottom], got {crop_box!r}.")
+    left, top, right, bottom = (max(0.0, min(1.0, v)) for v in (left, top, right, bottom))
+    if right <= left or bottom <= top:
+        raise ValueError(f"crop_box {crop_box!r} has zero or negative width/height once clamped to [0, 1].")
+    return (left, top, right, bottom)
+
+
 def _enhance_contrast(arr: np.ndarray, saturate_pct: float) -> np.ndarray:
     """ImageJ Enhance-Contrast-style stretch: clip the extreme saturate_pct%
     of pixels at each end, then linearly rescale the rest to fill 0-255.
@@ -370,6 +410,7 @@ def _luminance_grid(
     saturate_pct: float = 1.0,
     crop_box=None,
 ) -> np.ndarray:
+    crop_box = _validate_crop_box(crop_box)
     img = Image.open(image_path).convert("L")  # 8-bit, ITU-R 601-2 luminance (~ImageJ's weighted conversion)
     if crop_box is not None:
         w0, h0 = img.size
@@ -505,10 +546,13 @@ def analyze_surface_topology(
         against each other under matched lighting, not as trustworthy
         absolute roughness values for a spec sheet or paper.
     """
-    if not os.path.exists(image_path):
-        return {"status": "error", "message": f"Image not found: {image_path}"}
-
-    luminance = _luminance_grid(image_path, grid_size, enhance_contrast, contrast_saturate_pct, crop_box)
+    error = _validate_image_file(image_path)
+    if error:
+        return {"status": "error", "message": error}
+    try:
+        luminance = _luminance_grid(image_path, grid_size, enhance_contrast, contrast_saturate_pct, crop_box)
+    except ValueError as e:
+        return {"status": "error", "message": str(e)}
     mean_l = float(np.mean(luminance))
     std_l = float(np.std(luminance))
     cv = (std_l / mean_l) if mean_l > 0 else None
@@ -582,20 +626,26 @@ def qc_sensor_image(
                 "grid_distance": distance,
             }
 
-    if not os.path.exists(image_path):
-        return {"status": "error", "message": f"Image not found: {image_path}"}
+    error = _validate_image_file(image_path)
+    if error:
+        return {"status": "error", "message": error}
 
     context_line = f"\nAdditional context: {context}\n" if context else ""
     prompt = _PROMPT_TEMPLATE.format(context_line=context_line)
 
     mime_type = _MIME_TYPES.get(Path(image_path).suffix.lower(), "image/jpeg")
-    response = client().models.generate_content(
-        model=MODEL,
-        contents=[prompt, types.Part.from_bytes(data=Path(image_path).read_bytes(), mime_type=mime_type)],
-        config=types.GenerateContentConfig(response_mime_type="application/json"),
-    )
+    try:
+        response = client().models.generate_content(
+            model=MODEL,
+            contents=[prompt, types.Part.from_bytes(data=Path(image_path).read_bytes(), mime_type=mime_type)],
+            config=types.GenerateContentConfig(response_mime_type="application/json"),
+        )
+        content = response.text
+    except Exception as e:
+        return {"status": "error", "message": f"Vision model call failed: {e}"}
 
-    content = response.text
+    if content is None:
+        return {"status": "error", "message": "Vision model returned an empty response (possibly safety-blocked)."}
     try:
         parsed = json.loads(content)
     except json.JSONDecodeError:

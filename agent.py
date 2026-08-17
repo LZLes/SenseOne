@@ -19,9 +19,10 @@ agent loop -- unchanged from the original design.
 
 import json
 
+from google.genai import errors as genai_errors
 from google.genai import types
 
-from tools._gemini import client, MODEL
+from tools._gemini import client, MODEL, api_key_configured
 from tools.sensor_qc import qc_electrochemical_data, SENSOR_QC_SCHEMA
 from tools.cv_stability import analyze_cv_stability, CV_STABILITY_SCHEMA
 from tools.literature import search_literature, LITERATURE_SCHEMA, note_path, _load_note
@@ -314,15 +315,55 @@ def run_tool_call(name: str, args: dict) -> dict:
     return json.loads(json.dumps(result, default=str))
 
 
+class ModelCallError(RuntimeError):
+    """A Gemini call failed in a way the caller should show to the user
+    (network error, quota/rate-limit exhausted after retries, safety block,
+    empty response) rather than let crash the process.
+    """
+
+
+# Hard cap on tool-call round-trips for a single user turn -- without this, a
+# model that keeps reacting to a confusing tool result with more tool calls
+# (rather than ever giving a final answer) would hang that session
+# indefinitely and burn through the one shared GEMINI_API_KEY everyone else
+# also depends on during a demo.
+MAX_HOPS = 15
+
+
+def _call_model(contents: list):
+    """Calls Gemini and returns the first candidate, raising ModelCallError
+    (instead of letting an IndexError/AttributeError/API exception escape)
+    for every way that call can fail to produce a usable candidate: network/
+    quota errors, and safety-blocked or otherwise empty responses.
+    """
+    try:
+        response = client().models.generate_content(model=MODEL, contents=contents, config=GENERATE_CONFIG)
+    except genai_errors.APIError as e:
+        raise ModelCallError(f"Gemini API error ({getattr(e, 'code', '?')}): {getattr(e, 'message', e)}") from e
+    except Exception as e:
+        raise ModelCallError(f"Could not reach Gemini: {e}") from e
+
+    candidates = response.candidates or []
+    if not candidates:
+        feedback = getattr(response, "prompt_feedback", None)
+        raise ModelCallError(f"Gemini returned no response (possibly blocked). {feedback or ''}".strip())
+    candidate = candidates[0]
+    if candidate.content is None:
+        reason = getattr(candidate, "finish_reason", "unknown")
+        raise ModelCallError(f"Gemini returned an empty response (finish_reason={reason}).")
+    return candidate
+
+
 def run_hops(contents: list) -> list:
     """Repeatedly calls Gemini, executing any function calls it returns and
     feeding the results back, until it answers with no further function
-    calls. Mutates `contents` in place (appends the model's turn and any
-    tool-result turns), and returns the final answer turn's parts.
+    calls (or MAX_HOPS is hit). Mutates `contents` in place (appends the
+    model's turn and any tool-result turns), and returns the final answer
+    turn's parts. Raises ModelCallError if a Gemini call itself fails --
+    callers should catch that and report it rather than crash.
     """
-    while True:
-        response = client().models.generate_content(model=MODEL, contents=contents, config=GENERATE_CONFIG)
-        candidate = response.candidates[0]
+    for _hop in range(MAX_HOPS):
+        candidate = _call_model(contents)
         parts = candidate.content.parts or []
 
         thinking_text = "".join(p.text for p in parts if getattr(p, "thought", False) and p.text)
@@ -345,6 +386,18 @@ def run_hops(contents: list) -> list:
         # ride back as a "user" turn, distinguished from real user input by
         # containing function_response parts instead of text.
         contents.append(types.Content(role="user", parts=response_parts))
+
+    # Hit the round-trip cap without a final answer. Every function_call
+    # above already got a matching function_response appended, so contents
+    # stays well-formed -- we just stop asking for more hops and answer with
+    # a "model" turn (keeping role alternation intact) explaining why.
+    stop_text = (
+        f"(Stopped after {MAX_HOPS} tool-call round-trips without a final answer -- "
+        "try breaking the request into smaller steps.)"
+    )
+    stop_content = types.Content(role="model", parts=[types.Part.from_text(text=stop_text)])
+    contents.append(stop_content)
+    return stop_content.parts
 
 
 def _collect_cited_papers(contents, since_index) -> set:
@@ -398,7 +451,14 @@ def chat_loop():
         contents.append(types.Content(role="user", parts=[types.Part.from_text(text=user_input)]))
         turn_start = len(contents)
 
-        final_parts = run_hops(contents)
+        try:
+            final_parts = run_hops(contents)
+        except ModelCallError as e:
+            print(f"\nagent> [error] {e}\n")
+            continue
+        except Exception as e:  # last-resort guard -- a tool/library bug here should never kill the REPL
+            print(f"\nagent> [unexpected error] {e}\n")
+            continue
 
         cited_papers = _collect_cited_papers(contents, turn_start)
         answer = "".join(p.text for p in final_parts if p.text and not getattr(p, "thought", False))
