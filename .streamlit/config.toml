@@ -10,4 +10,9 @@ maxMessageSize = 15
 gatherUsageStats = false
 
 [client]
-showErrorDetails = true
+# "type" (not "full") -- the repo/app is public, so an uncaught exception
+# should surface enough to know what broke without leaking internal file
+# paths/stack traces to a random visitor. Every failure mode we anticipate
+# is already caught with its own clean st.error() message; this is only the
+# backstop for something unanticipated.
+showErrorDetails = "type"

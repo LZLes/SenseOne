@@ -94,23 +94,39 @@ def _render_image_gallery(images):
             st.image(path, caption=label)
 
 
-def _stream_turn(contents: list, collected_images: list) -> str:
-    """Streams each hop live (thinking token-by-token, then content), runs
+def _stream_turn(
+    contents: list,
+    collected_images: list,
+    generate_config=None,
+    show_thinking: bool = True,
+    max_hops: int = None,
+) -> str:
+    """Streams each hop live (thinking token-by-token, then the answer), runs
     any function calls that come back, and loops until the model gives a
-    final answer with no further function calls (or MAX_HOPS is hit). Only
+    final answer with no further function calls (or max_hops is hit). Only
     the final, function-call-free hop's text is treated as the real answer
     -- intermediate hops' content is a partial/incomplete read meant to lead
     into a tool call, not a chat message.
+
+    thinking_placeholder is reserved *before* content_slot each hop so the
+    reasoning always renders above the answer regardless of arrival timing
+    -- reversed, this used to reserve the answer's slot first, leaving an
+    empty box sitting above where the (usually earlier-arriving) reasoning
+    would later appear once the expander was created, which read as
+    out-of-order/glitchy as text filled in above-then-below out of sequence.
 
     Never lets a Gemini-call failure (network error, quota/rate-limit,
     safety block) raise out into Streamlit's default traceback view -- shows
     st.error instead and returns whatever text streamed before the failure.
     """
+    generate_config = generate_config or agent.GENERATE_CONFIG
+    max_hops = max_hops or agent.MAX_HOPS
     turn_start_len = len(contents)
 
-    for hop in range(agent.MAX_HOPS):
-        thinking_slot = None
+    for hop in range(max_hops):
+        thinking_placeholder = st.empty()  # reserved first -> renders above the answer
         content_slot = st.empty()
+        thinking_slot = None
         thinking_acc = ""
         content_acc = ""
         parts_acc = []
@@ -118,7 +134,7 @@ def _stream_turn(contents: list, collected_images: list) -> str:
 
         try:
             stream = agent.client().models.generate_content_stream(
-                model=agent.MODEL, contents=contents, config=agent.GENERATE_CONFIG,
+                model=agent.MODEL, contents=contents, config=generate_config,
             )
             for chunk in stream:
                 if not chunk.candidates or not chunk.candidates[0].content:
@@ -129,10 +145,11 @@ def _stream_turn(contents: list, collected_images: list) -> str:
                 for part in chunk_parts:
                     parts_acc.append(part)
                     if getattr(part, "thought", False) and part.text:
-                        if thinking_slot is None:
-                            thinking_slot = st.expander("\U0001f9e0 thinking", expanded=True).empty()
-                        thinking_acc += part.text
-                        thinking_slot.markdown(thinking_acc)
+                        if show_thinking:
+                            if thinking_slot is None:
+                                thinking_slot = thinking_placeholder.expander("\U0001f9e0 thinking", expanded=True).empty()
+                            thinking_acc += part.text
+                            thinking_slot.markdown(thinking_acc)
                     elif getattr(part, "function_call", None):
                         function_calls.append(part.function_call)
                     elif part.text:
@@ -183,9 +200,9 @@ def _stream_turn(contents: list, collected_images: list) -> str:
     # Hit the round-trip cap without a final answer. Every function_call
     # above already got a matching function_response appended, so contents
     # stays well-formed -- stop asking for more hops and say why.
-    st.warning(f"Stopped after {agent.MAX_HOPS} tool-call round-trips without a final answer.")
+    st.warning(f"Stopped after {max_hops} tool-call round-trips without a final answer.")
     stop_text = (
-        f"(Stopped after {agent.MAX_HOPS} tool-call round-trips without a final answer -- "
+        f"(Stopped after {max_hops} tool-call round-trips without a final answer -- "
         "try breaking the request into smaller steps.)"
     )
     contents.append(types.Content(role="model", parts=[types.Part.from_text(text=stop_text)]))
@@ -218,6 +235,24 @@ with st.sidebar:
         st.session_state.contents = []
         st.session_state.turn_images = {}
         st.rerun()
+
+    with st.expander("⚙️ Advanced settings"):
+        temperature = st.slider(
+            "Temperature", 0.0, 1.0, agent.DEFAULT_TEMPERATURE, 0.05,
+            help=(
+                "Lower = more consistent, literal answers (recommended for QC -- "
+                f"the system prompt is tuned around the default, {agent.DEFAULT_TEMPERATURE}). "
+                "Higher = more varied phrasing, more prone to embellishing beyond what a tool actually reported."
+            ),
+        )
+        show_thinking = st.checkbox(
+            "Show reasoning", value=True,
+            help="Stream the model's visible thinking before its answer. Turn off for a cleaner, answer-only view.",
+        )
+        max_hops = st.slider(
+            "Max tool-call rounds / turn", 1, 30, agent.MAX_HOPS,
+            help="Safety cap -- stops a confused model from looping on tool calls indefinitely and burning shared API quota.",
+        )
 
     st.divider()
     st.caption("upload a photo")
@@ -276,10 +311,14 @@ for i, content in enumerate(st.session_state.contents):
                 st.markdown(text)
                 _render_image_gallery(st.session_state.turn_images.get(i, []))
 
+MAX_MESSAGE_CHARS = 4000  # a runaway paste shouldn't be able to single-handedly burn a big chunk of shared quota
+
 user_input = st.chat_input(
     "Ask about a sensor, image, paper, or batch..."
     if agent.api_key_configured() else "Set GEMINI_API_KEY to start chatting (see sidebar)",
     disabled=not agent.api_key_configured(),
+    max_chars=MAX_MESSAGE_CHARS,
+    submit_mode="disable",  # disables the input while a turn is in flight -- blocks double-submit spam on the shared key
 )
 if user_input:
     pending = st.session_state.pending_upload_path
@@ -294,7 +333,11 @@ if user_input:
             st.caption(f"\U0001f4ce {pending}")
     with st.chat_message("assistant"):
         images = []
-        _stream_turn(st.session_state.contents, images)
+        _stream_turn(
+            st.session_state.contents, images,
+            generate_config=agent.build_generate_config(temperature=temperature, include_thoughts=show_thinking),
+            show_thinking=show_thinking, max_hops=max_hops,
+        )
         _render_image_gallery(images)
         if images:
             # final assistant turn is the last one appended

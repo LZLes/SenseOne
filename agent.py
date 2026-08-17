@@ -294,12 +294,25 @@ GEMINI_TOOL = _to_gemini_tool(TOOLS)
 # citations, where creative token sampling shows up as fabricated-sounding
 # detail rather than useful variety. Doesn't eliminate hallucination, just
 # reduces one source of it.
-GENERATE_CONFIG = types.GenerateContentConfig(
-    system_instruction=SYSTEM_PROMPT,
-    tools=[GEMINI_TOOL],
-    thinking_config=types.ThinkingConfig(include_thoughts=True),
-    temperature=0.2,
-)
+DEFAULT_TEMPERATURE = 0.2
+
+
+def build_generate_config(temperature: float = DEFAULT_TEMPERATURE, include_thoughts: bool = True) -> types.GenerateContentConfig:
+    """Builds a GenerateContentConfig -- factored out so a caller (the
+    Streamlit GUI's sidebar) can offer temperature/reasoning-visibility as
+    user-adjustable settings without duplicating the system prompt/tools
+    wiring. The CLI just uses the module-level GENERATE_CONFIG default
+    below, unchanged.
+    """
+    return types.GenerateContentConfig(
+        system_instruction=SYSTEM_PROMPT,
+        tools=[GEMINI_TOOL],
+        thinking_config=types.ThinkingConfig(include_thoughts=include_thoughts),
+        temperature=temperature,
+    )
+
+
+GENERATE_CONFIG = build_generate_config()
 
 
 def run_tool_call(name: str, args: dict) -> dict:
