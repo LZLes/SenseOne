@@ -35,9 +35,13 @@ LITERATURE_SCHEMA = {
         "name": "search_literature",
         "description": (
             "Search PubMed and/or arXiv for recent papers on a topic and return "
-            "titles, authors, dates, links, and abstracts/summaries. Repeat queries "
-            "are served from a local vault (literature_vault/) instead of re-fetching; "
-            "pass refresh=True to bypass the vault and search live."
+            "titles, authors, dates, links, and abstracts/summaries. Each result carries "
+            "open_access (bool) -- true for every arXiv preprint, and for PubMed papers "
+            "confirmed open access via PMC (checked automatically, no extra call needed) -- "
+            "and results are sorted open-access-first, since only those can actually be "
+            "pulled full-text via analyze_literature_figures for the researcher to verify "
+            "against. Repeat queries are served from a local vault (literature_vault/) "
+            "instead of re-fetching; pass refresh=True to bypass the vault and search live."
         ),
         "parameters": {
             "type": "object",
@@ -72,6 +76,37 @@ PUBMED_ESEARCH = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
 PUBMED_ESUMMARY = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
 PUBMED_EFETCH = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
 ARXIV_API = "http://export.arxiv.org/api/query"
+EUROPEPMC_SEARCH = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
+
+
+def _lookup_open_access(pmids: list) -> dict:
+    """Batch-checks which of these PubMed IDs are open access via PMC (one
+    OR'd query instead of one request per paper). Returns
+    {pmid: {"open_access": bool, "pmcid": str|None}}; any pmid Europe PMC
+    doesn't return, or if the lookup fails outright, defaults to
+    open_access=False -- a missed "yes" just means a good paper doesn't get
+    bumped to the top, not a wrong claim that a paywalled paper is readable.
+    """
+    result = {pmid: {"open_access": False, "pmcid": None} for pmid in pmids}
+    if not pmids:
+        return result
+    # Parenthesize the OR'd terms -- Europe PMC's query parser binds AND
+    # tighter than OR, so an unparenthesized "A OR B OR C AND SRC:MED" only
+    # applies the SRC:MED filter to C, not the whole OR group (confirmed
+    # empirically: it silently matched ~1 result instead of len(pmids)).
+    query = "(" + " OR ".join(f"EXT_ID:{pmid}" for pmid in pmids) + ") AND SRC:MED"
+    try:
+        resp = requests.get(
+            EUROPEPMC_SEARCH, params={"query": query, "format": "json", "pageSize": len(pmids)}, timeout=15,
+        )
+        resp.raise_for_status()
+        for r in resp.json().get("resultList", {}).get("result", []):
+            pmid = r.get("pmid")
+            if pmid in result:
+                result[pmid] = {"open_access": r.get("isOpenAccess") == "Y", "pmcid": r.get("pmcid")}
+    except Exception:
+        pass  # best-effort enrichment -- a lookup failure shouldn't break the search itself
+    return result
 
 
 def _search_pubmed(query: str, max_results: int) -> list:
@@ -120,7 +155,19 @@ def _search_pubmed(query: str, max_results: int) -> list:
             "date": year,
             "url": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/" if pmid else None,
             "summary": abstract[:1000],
+            "_pmid": pmid,
         })
+
+    # Open access via PMC means analyze_literature_figures can actually pull
+    # the full text/figures, not just an abstract -- prioritize those so the
+    # researcher (and the model summarizing results) can go verify claims
+    # against real content instead of just a paywalled abstract.
+    oa_by_pmid = _lookup_open_access([r["_pmid"] for r in results if r["_pmid"]])
+    for r in results:
+        oa = oa_by_pmid.get(r.pop("_pmid"), {"open_access": False, "pmcid": None})
+        r["open_access"] = oa["open_access"]
+        r["pmcid"] = oa["pmcid"]
+    results.sort(key=lambda r: not r["open_access"])  # stable sort -- open access first, relevance order preserved within each group
     return results
 
 
@@ -152,6 +199,8 @@ def _search_arxiv(query: str, max_results: int) -> list:
             "date": published,
             "url": url,
             "summary": summary[:1000],
+            "open_access": True,  # arXiv preprints are always open
+            "pmcid": None,
         })
     return results
 
@@ -199,6 +248,8 @@ def _save_note(paper: dict, query: str):
     meta.setdefault("authors", paper.get("authors", []))
     meta.setdefault("date", paper.get("date"))
     meta.setdefault("url", paper.get("url"))
+    meta.setdefault("open_access", paper.get("open_access", False))
+    meta.setdefault("pmcid", paper.get("pmcid"))
     meta.setdefault("saved", date.today().isoformat())
     queries = meta.setdefault("queries", [])
     if _normalize_query(query) not in [_normalize_query(q) for q in queries]:
@@ -225,8 +276,11 @@ def _search_vault(query: str) -> list:
                 "authors": meta.get("authors", []),
                 "date": meta.get("date"),
                 "url": meta.get("url"),
+                "open_access": meta.get("open_access", meta.get("source") == "arxiv"),
+                "pmcid": meta.get("pmcid"),
                 "summary": body,
             })
+    matches.sort(key=lambda r: not r["open_access"])  # same open-access-first ordering as a live search
     return matches
 
 
@@ -266,6 +320,12 @@ def search_literature(query: str, source: str = "both", max_results: int = 5, re
             results.extend(_search_arxiv(query, max_results))
         except Exception as e:
             errors.append(f"arxiv: {e}")
+
+    # Re-sort the combined list -- _search_pubmed already sorts its own
+    # results open-access-first, but appending arXiv's (always open) results
+    # after could still put a paywalled PubMed paper ahead of an open arXiv
+    # one in the final list.
+    results.sort(key=lambda r: not r.get("open_access", False))
 
     for paper in results:
         paper["paper_id"] = _paper_id(paper)
