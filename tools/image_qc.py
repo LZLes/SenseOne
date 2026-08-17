@@ -415,7 +415,19 @@ def _luminance_grid(
     if crop_box is not None:
         w0, h0 = img.size
         left, top, right, bottom = crop_box
-        img = img.crop((int(left * w0), int(top * h0), int(right * w0), int(bottom * h0)))
+        box_px = (int(left * w0), int(top * h0), int(right * w0), int(bottom * h0))
+        # _validate_crop_box only checks the *fractional* box is non-degenerate;
+        # a narrow-but-valid fraction can still truncate to a 0px-wide/tall
+        # crop once multiplied by real pixel dimensions and int()-truncated
+        # (e.g. a 1e-7 fraction on an 800px-wide image) -- that would
+        # otherwise crash deeper in resize/percentile/roughness math with a
+        # confusing IndexError instead of a clear, actionable message here.
+        if box_px[2] - box_px[0] < 2 or box_px[3] - box_px[1] < 2:
+            raise ValueError(
+                f"crop_box {crop_box} resolves to a {box_px[2] - box_px[0]}x{box_px[3] - box_px[1]}px crop "
+                f"on this {w0}x{h0}px image -- too small to analyze. Use a wider fractional box."
+            )
+        img = img.crop(box_px)
     arr = np.asarray(img, dtype=float)
     if enhance_contrast:
         arr = _enhance_contrast(arr, saturate_pct)
@@ -668,15 +680,29 @@ def qc_sensor_image(
         )
 
     if include_surface_analysis:
-        surface = analyze_surface_topology(
-            image_path, surface_grid_size, max_luminance_cv,
-            surface_enhance_contrast, surface_contrast_saturate_pct,
-            tuple(surface_crop_box) if surface_crop_box else WORKING_ELECTRODE_CROP_BOX,
-        )
+        try:
+            surface_crop_box = tuple(surface_crop_box) if surface_crop_box else WORKING_ELECTRODE_CROP_BOX
+        except TypeError:
+            surface = {"status": "error", "message": f"surface_crop_box must be a list of 4 numbers, got {surface_crop_box!r}."}
+        else:
+            surface = analyze_surface_topology(
+                image_path, surface_grid_size, max_luminance_cv,
+                surface_enhance_contrast, surface_contrast_saturate_pct, surface_crop_box,
+            )
         parsed["surface_analysis"] = surface
-        rank = {"pass": 0, "warn": 1, "fail": 2}
-        if surface.get("status") in rank and rank[surface["status"]] > rank.get(parsed["status"], 0):
-            parsed["status"] = surface["status"]
+        if surface.get("status") == "error":
+            # Explicitly requested but couldn't run -- don't let a "pass"
+            # vision-only status paper over that silently; the detailed
+            # reason is in surface_analysis.message. Doesn't downgrade an
+            # already-worse vision verdict, and keeps the overall status in
+            # the pass/warn/fail vocabulary every downstream consumer expects
+            # (append_qc_result, electrode_notes' status ranking, etc.).
+            if parsed["status"] == "pass":
+                parsed["status"] = "warn"
+        else:
+            rank = {"pass": 0, "warn": 1, "fail": 2}
+            if surface.get("status") in rank and rank[surface["status"]] > rank.get(parsed["status"], 0):
+                parsed["status"] = surface["status"]
 
     try:
         if electrode_code:

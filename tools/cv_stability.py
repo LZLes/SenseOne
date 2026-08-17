@@ -177,6 +177,16 @@ def analyze_cv_stability(
         return {"status": "error", "message": f"Could not find multi-scan CV data in {csv_path}."}
 
     n_scans = data.shape[1] // 2
+    if disregard_first_n_scans < 0:
+        # range(negative, n_scans) doesn't error -- it produces negative
+        # indices that silently wrap around via Python's negative-index
+        # semantics (data[:, 2*idx] aliases columns from the end), reporting
+        # duplicate/garbage "scans" under nonsensical negative scan numbers
+        # instead of failing. Reject it explicitly rather than let that happen.
+        return {
+            "status": "error",
+            "message": f"disregard_first_n_scans must be >= 0, got {disregard_first_n_scans}.",
+        }
     used_indices = list(range(disregard_first_n_scans, n_scans))
     if not used_indices:
         return {
