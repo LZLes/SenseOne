@@ -24,7 +24,7 @@ from datetime import date
 
 from google.genai import types
 
-from tools._gemini import client, MODEL
+from tools._gemini import client, MODEL, request_slot
 from tools.literature import VAULT_DIR, _load_note, _normalize_query, search_literature
 from tools.literature_figures import analyze_literature_figures
 
@@ -187,11 +187,12 @@ def _generate_insights() -> str:
     prompt = _INSIGHTS_PROMPT_TEMPLATE.format(vault_content=vault_content)
 
     try:
-        response = client().models.generate_content(
-            model=MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(temperature=0.2),
-        )
+        with request_slot():
+            response = client().models.generate_content(
+                model=MODEL,
+                contents=prompt,
+                config=types.GenerateContentConfig(temperature=0.2),
+            )
         content = (response.text or "").strip()
     except Exception as e:
         return f"_Could not generate insights: {e}_"

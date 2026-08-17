@@ -38,7 +38,7 @@ from PIL import Image
 from scipy.ndimage import gaussian_filter
 from scipy.stats import kurtosis, skew
 
-from tools._gemini import client, MODEL
+from tools._gemini import client, MODEL, request_slot
 from tools.electrode_notes import append_qc_result, extract_batch_date, extract_grid_code
 
 _IMAGE_EXTS = (".bmp", ".jpg", ".jpeg", ".png")
@@ -647,11 +647,12 @@ def qc_sensor_image(
 
     mime_type = _MIME_TYPES.get(Path(image_path).suffix.lower(), "image/jpeg")
     try:
-        response = client().models.generate_content(
-            model=MODEL,
-            contents=[prompt, types.Part.from_bytes(data=Path(image_path).read_bytes(), mime_type=mime_type)],
-            config=types.GenerateContentConfig(response_mime_type="application/json"),
-        )
+        with request_slot():
+            response = client().models.generate_content(
+                model=MODEL,
+                contents=[prompt, types.Part.from_bytes(data=Path(image_path).read_bytes(), mime_type=mime_type)],
+                config=types.GenerateContentConfig(response_mime_type="application/json"),
+            )
         content = response.text
     except Exception as e:
         return {"status": "error", "message": f"Vision model call failed: {e}"}

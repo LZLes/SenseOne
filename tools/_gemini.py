@@ -5,6 +5,7 @@ directly (image_qc.py, literature_figures.py, vault_maintenance.py).
 """
 
 import os
+import threading
 
 from dotenv import load_dotenv
 from google import genai
@@ -66,3 +67,38 @@ def client() -> genai.Client:
             )
         _client = genai.Client(api_key=api_key, http_options=_HTTP_OPTIONS)
     return _client
+
+
+# Every visitor to a hosted deploy shares this one process and one
+# GEMINI_API_KEY. Without a cap, a burst of simultaneous requests (several
+# judges trying it at once, or someone scripting against the shared key)
+# hits the free-tier rate limit all at once and cascades into a wave of
+# 429s that the retry logic above then has to individually recover from.
+# Queuing requests here instead spreads that same burst out, so most of it
+# never needs a retry in the first place. Every direct
+# client().models.generate_content[_stream](...) call in this codebase
+# (agent.py, app.py, image_qc.py, literature_figures.py,
+# vault_maintenance.py) is wrapped in `with request_slot():`.
+MAX_CONCURRENT_REQUESTS = 3
+_request_semaphore = threading.Semaphore(MAX_CONCURRENT_REQUESTS)
+_REQUEST_SLOT_TIMEOUT_S = 45
+
+
+class RequestQueueFullError(RuntimeError):
+    """Raised when the concurrent-request cap couldn't be acquired in time --
+    the shared demo is under heavier load than it can queue through.
+    """
+
+
+class request_slot:
+    def __enter__(self):
+        if not _request_semaphore.acquire(timeout=_REQUEST_SLOT_TIMEOUT_S):
+            raise RequestQueueFullError(
+                f"This demo is handling {MAX_CONCURRENT_REQUESTS} requests at once already and yours "
+                f"didn't get a turn within {_REQUEST_SLOT_TIMEOUT_S}s -- please try again in a moment."
+            )
+        return self
+
+    def __exit__(self, *exc_info):
+        _request_semaphore.release()
+        return False

@@ -29,7 +29,7 @@ import requests
 from google.genai import types
 from PIL import Image
 
-from tools._gemini import client, MODEL
+from tools._gemini import client, MODEL, request_slot
 from tools.literature import VAULT_DIR, _load_note, _safe_id_component, append_figures_section, note_path
 
 FIGURES_DIR = VAULT_DIR / "figures"
@@ -191,11 +191,12 @@ def _caption_figure(image_bytes: bytes, context: str = "") -> dict:
     context_line = f"\nAdditional context: {context}\n" if context else ""
     prompt = _CAPTION_PROMPT_TEMPLATE.format(context_line=context_line)
     try:
-        response = client().models.generate_content(
-            model=MODEL,
-            contents=[prompt, types.Part.from_bytes(data=_downsize_for_captioning(image_bytes), mime_type="image/jpeg")],
-            config=types.GenerateContentConfig(response_mime_type="application/json"),
-        )
+        with request_slot():
+            response = client().models.generate_content(
+                model=MODEL,
+                contents=[prompt, types.Part.from_bytes(data=_downsize_for_captioning(image_bytes), mime_type="image/jpeg")],
+                config=types.GenerateContentConfig(response_mime_type="application/json"),
+            )
         parsed = json.loads(response.text)
     except json.JSONDecodeError:
         parsed = {"figure_type": "other", "description": "(caption failed to parse)", "quality_note": ""}

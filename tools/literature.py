@@ -57,7 +57,7 @@ LITERATURE_SCHEMA = {
                 },
                 "max_results": {
                     "type": "integer",
-                    "description": "Max results per source. Default 5.",
+                    "description": "Max results per source. Default 8 -- pass higher for a deliberately broad sweep of a topic.",
                 },
                 "refresh": {
                     "type": "boolean",
@@ -300,7 +300,7 @@ def append_figures_section(paper_id: str, figures_md: str):
     path.write_text(f"---\n{json.dumps(meta, indent=2)}\n---\n\n{body}\n", encoding="utf-8")
 
 
-def search_literature(query: str, source: str = "both", max_results: int = 5, refresh: bool = False) -> dict:
+def search_literature(query: str, source: str = "both", max_results: int = 8, refresh: bool = False) -> dict:
     if not refresh:
         cached = _search_vault(query)
         if cached:

@@ -22,7 +22,7 @@ import json
 from google.genai import errors as genai_errors
 from google.genai import types
 
-from tools._gemini import client, MODEL, api_key_configured
+from tools._gemini import client, MODEL, api_key_configured, request_slot, RequestQueueFullError
 from tools.sensor_qc import qc_electrochemical_data, SENSOR_QC_SCHEMA
 from tools.cv_stability import analyze_cv_stability, CV_STABILITY_SCHEMA
 from tools.literature import search_literature, LITERATURE_SCHEMA, note_path, _load_note
@@ -126,6 +126,24 @@ biosensor lab. You help the researcher:
      and verify one, and analyze_literature_figures only works on them
      anyway. Don't drop a paywalled paper's finding just because it's not
      open access, but don't lead with it over an equally relevant open one.
+     Pass a higher max_results (default 5) when the researcher wants a
+     broad view of a topic rather than just a couple of leads -- don't
+     settle for the default when "what's out there on X" is really the ask.
+     You also have two built-in web tools, separate from search_literature:
+     google_search can find things PubMed/arXiv don't index at all
+     (other journals/publishers, datasheets, standards, non-preprint
+     content), and url_context can read a specific URL/DOI the researcher
+     pastes in directly. Reach for these when search_literature comes up
+     short or the researcher explicitly wants something from the wider
+     web/a specific link -- but default to search_literature/the vault
+     first for biosensor literature specifically, since those results are
+     vault-cached, carry a paper_id for analyze_literature_figures, and
+     don't spend web-search quota on something the vault might already
+     answer. Every citation, from either source, must include the actual
+     URL inline (a paper_id alone isn't clickable) -- for search_literature
+     results this is the tool result's own url field; for a web result,
+     it's the real source URL the search/URL-read returned, never a
+     guessed or reconstructed one.
   5. Pull and caption figures from a paper (CV/CA/EIS plots, SEM images) by
      calling analyze_literature_figures with a paper_id from a prior
      search_literature result -- useful when the researcher wants to
@@ -226,26 +244,45 @@ biosensor lab. You help the researcher:
       -- pass sub_position, don't average them together as if they were
       replicates of one electrode.
 
-Grounding rules -- these matter because you can drift into plausible-sounding
-but unsupported claims:
-  - Never state a specific number, defect, or literature finding unless it
-    came from a tool's output in this conversation. If you're inferring or
-    speculating rather than reporting a tool result, say so explicitly
-    ("this isn't from the QC output, but a plausible explanation is...").
-  - Every claim that comes from a paper -- a finding, a typical failure
-    mode, a figure's content -- must be tagged inline with its source, in
-    the form (Author/short-title, paper_id), e.g. "(Sengupta et al.,
-    arxiv_2012.05543v1)". Use the paper_id from search_literature /
-    analyze_literature_figures, not a made-up citation. If a claim can't be
-    tied to a specific paper_id, don't attribute it to "the literature" --
-    either cite the exact paper or drop the attribution and say it's your
-    own inference.
+Grounding rules -- treat these as hard constraints, not style preferences.
+This agent's entire value proposition is that a researcher can trust what it
+reports without re-verifying it by hand; a single fabricated number or
+citation undermines that far more than an honest "I don't know" or "a tool
+couldn't determine this" ever would. When in doubt, say less, not more.
+  - Never state a specific number, defect, status, or literature finding
+    unless it came from a tool's output in this conversation. If you're
+    inferring or speculating rather than reporting a tool result, say so
+    explicitly ("this isn't from the QC output, but a plausible explanation
+    is..."). This includes numbers you derive yourself: if you compute a
+    ratio, percentage, difference, or comparison from tool-reported values
+    (e.g. "3x higher", "a 12% drop"), show the exact source values and the
+    arithmetic, not just the derived conclusion -- a silent derivation is as
+    ungrounded as an invented number if the arithmetic is ever wrong.
+  - Every claim that comes from a paper or web source -- a finding, a
+    typical failure mode, a figure's content -- must be tagged inline with
+    its source AND a real, clickable URL, not just a name. For
+    search_literature/analyze_literature_figures results: (Author/short-title,
+    paper_id) plus the result's own url field, e.g. "(Sengupta et al.,
+    arxiv_2012.05543v1, https://arxiv.org/abs/2012.05543)". For
+    google_search/url_context results: the actual source title/domain plus
+    the real URL the tool returned. Never guess, reconstruct, or omit a URL,
+    and never attribute something to "the literature" or "online" in the
+    abstract -- name the specific source every time or drop the claim.
   - If a tool call errors or returns ambiguous data, report that plainly
     instead of filling the gap with a guess.
+  - Before sending your final answer, scan it once more: every number,
+    status, defect, and citation should trace to a specific tool call
+    earlier in this turn (or an earlier get_electrode_note/get_batch_digest
+    you called). If you can't point to where something came from, remove it
+    or explicitly mark it as your own inference rather than let it stand as
+    if it were grounded.
 
 Always call a tool when the user's request needs live data (a file to check,
 or a topic to search) rather than guessing. Be concise and technical; this is
-a PhD-level audience.
+a PhD-level audience. Don't narrate your own tool-use process or planning in
+the final answer ("I'll start by...", "next I need to...") -- the visible
+thinking stream already shows that; the final answer should be the actual
+result, not a recap of how you got there.
 """
 
 TOOLS = [
@@ -299,11 +336,29 @@ def _to_gemini_tool(tools: list) -> types.Tool:
 
 GEMINI_TOOL = _to_gemini_tool(TOOLS)
 
-# Lower than the default -- this agent reports specific numbers and
+# Gemini's own built-in tools, not custom function declarations -- these run
+# server-side (the model decides when to invoke them; results never come
+# back as a function_call part we'd need to dispatch ourselves, confirmed
+# empirically: none of a grounded response's tool_call/tool_response parts
+# set .function_call, so they can't collide with run_hops'/`_stream_turn`'s
+# function-call handling). google_search extends literature lookups past
+# just PubMed/arXiv to the open web (any journal, publisher page, dataset,
+# datasheet); url_context lets the model read a specific URL/DOI the
+# researcher pastes in directly. Both require
+# tool_config.include_server_side_tool_invocations=True to combine with our
+# own function-calling tools in the same request -- confirmed via a 400
+# error otherwise ("Please enable tool_config.include_server_side_tool_invocations
+# to use Built-in tools with Function calling"), not documented anywhere obvious.
+WEB_TOOLS = [types.Tool(google_search=types.GoogleSearch()), types.Tool(url_context=types.UrlContext())]
+
+# Well below the API default -- this agent reports specific numbers and
 # citations, where creative token sampling shows up as fabricated-sounding
-# detail rather than useful variety. Doesn't eliminate hallucination, just
-# reduces one source of it.
-DEFAULT_TEMPERATURE = 0.2
+# detail rather than useful variety. Doesn't eliminate hallucination on its
+# own (that's what the grounding rules + citation backstop above are for),
+# just removes one source of it. Not 0.0 -- some models get repetitive/loopy
+# at the extreme, and this is already low enough that the difference isn't
+# meaningfully more grounded, just more deterministic.
+DEFAULT_TEMPERATURE = 0.1
 
 
 def build_generate_config(temperature: float = DEFAULT_TEMPERATURE, include_thoughts: bool = True) -> types.GenerateContentConfig:
@@ -315,7 +370,8 @@ def build_generate_config(temperature: float = DEFAULT_TEMPERATURE, include_thou
     """
     return types.GenerateContentConfig(
         system_instruction=SYSTEM_PROMPT,
-        tools=[GEMINI_TOOL],
+        tools=[GEMINI_TOOL, *WEB_TOOLS],
+        tool_config=types.ToolConfig(include_server_side_tool_invocations=True),
         thinking_config=types.ThinkingConfig(include_thoughts=include_thoughts),
         temperature=temperature,
     )
@@ -359,9 +415,17 @@ def _call_model(contents: list):
     quota errors, and safety-blocked or otherwise empty responses.
     """
     try:
-        response = client().models.generate_content(model=MODEL, contents=contents, config=GENERATE_CONFIG)
+        with request_slot():
+            response = client().models.generate_content(model=MODEL, contents=contents, config=GENERATE_CONFIG)
     except genai_errors.APIError as e:
+        if getattr(e, "code", None) == 429:
+            raise ModelCallError(
+                "Gemini's rate limit was hit (this demo shares one free-tier API key across every "
+                "visitor) -- wait a few seconds and try again."
+            ) from e
         raise ModelCallError(f"Gemini API error ({getattr(e, 'code', '?')}): {getattr(e, 'message', e)}") from e
+    except RequestQueueFullError as e:
+        raise ModelCallError(str(e)) from e
     except Exception as e:
         raise ModelCallError(f"Could not reach Gemini: {e}") from e
 
