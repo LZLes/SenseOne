@@ -34,13 +34,14 @@ specific tool implementations, not as a peer agent the orchestrator
 talks to). An earlier version ran fully locally on Ollama
 (`qwen3:8b` + `qwen2.5vl:7b`, one model per role); the backend was
 swapped to make the agent deployable as a hosted link (Streamlit
-Community Cloud, from a private GitHub repo) without requiring every
+Community Cloud, from a now-public GitHub repo) without requiring every
 user to install Ollama and pull ~11GB of local models. The tools,
 system prompt, and control flow are unchanged from the original —
 only the LLM backend and message-shape plumbing differ.
 
-17 tools are registered against a single schema/dispatch layer
-(`agent.py`), grouped by what they do:
+18 custom tools are registered against a single schema/dispatch layer
+(`agent.py`), grouped by what they do, plus two of Gemini's own
+built-in tools (not custom function declarations — see "Web search" below):
 
 - **Raw-data QC** — `sensor_qc`, `analyze_cv_stability`,
   `ca_calibration` parse instrument CSV exports (multiple encodings
@@ -53,6 +54,13 @@ only the LLM backend and message-shape plumbing differ.
   the electrochemistry) and `compare_to_batch_reference` (unsupervised
   outlier detection via SSIM against a registered pixel-average
   "typical" print, no labeled examples needed).
+- **Electrochemical batch QC** — `compare_cv_to_batch_reference`, the
+  electrical-data counterpart to the photo-based outlier check above:
+  is this electrode's CV/CA data (peak current, ΔEp, ipa/ipc ratio,
+  scan-to-scan stability, CA sensitivity/R²/LOD) a statistical outlier
+  vs. the rest of its own batch, via a modified z-score (median + MAD).
+  See "Adding a new QC algorithm" below for why this specific method,
+  and which candidate algorithms were deliberately *not* built.
 - **Performance prediction** — `correlate_visual_cv_performance` and
   `predict_electrode_performance`, which pull every paired
   visual/electrical result recorded so far and only assert a grounded
@@ -60,21 +68,84 @@ only the LLM backend and message-shape plumbing differ.
 - **Persistent memory** — auto-populated per-electrode/per-batch
   Markdown records (`electrode_notes/`) that every QC tool above
   writes into without being asked, so history is available across
-  sessions by default.
+  sessions by default. Writes are serialized per-electrode (an
+  in-process lock) so two concurrent QC calls against the same
+  electrode can't silently drop each other's history, and a note that
+  fails to parse gets backed up rather than silently overwritten blank.
 - **Literature** — PubMed/arXiv search with a local cache
-  (`literature_vault/`), figure extraction, and citation-grounded
-  synthesis.
+  (`literature_vault/`), automatic open-access detection, figure
+  extraction, and citation-grounded synthesis.
 
 The control flow is a standard multi-hop tool loop: the model reasons
 (visible thinking), decides which tool(s) to call, the result is fed
 back into the conversation, and the loop continues until the model
-answers without further tool calls. Two interfaces — a terminal CLI
-(`agent.py`) and a Streamlit GUI (`app.py`, with live thinking stream,
-inline plots/photos, and image upload) — sit on top of the identical
-tool layer, so no logic is duplicated between them. The Streamlit GUI
-is what's deployed to Streamlit Community Cloud; the only per-environment
-requirement is a `GEMINI_API_KEY` (free tier, https://aistudio.google.com/apikey),
+answers without further tool calls (or hits `agent.MAX_HOPS`, a hard
+cap so a confused model can't loop forever on the shared API quota).
+Two interfaces — a terminal CLI (`agent.py`) and a Streamlit GUI
+(`app.py`, with live thinking stream, inline plots/photos, image
+upload, and user-adjustable temperature/reasoning-visibility/hop-cap
+settings) — sit on top of the identical tool layer, so no logic is
+duplicated between them. The Streamlit GUI is what's deployed to
+Streamlit Community Cloud; the only per-environment requirement is a
+`GEMINI_API_KEY` (free tier, https://aistudio.google.com/apikey),
 loaded from `.env` locally or from Streamlit's secrets manager when hosted.
+
+## Web search: going beyond the local vault
+
+Gemini has two built-in server-side tools — `google_search` (live web
+search with citation grounding) and `url_context` (read a specific
+URL/DOI) — that run alongside the 18 custom function-calling tools
+above, in the same request. Combining them isn't documented anywhere
+obvious: the first attempt returned a 400 error ("Please enable
+tool_config.include_server_side_tool_invocations to use Built-in tools
+with Function calling"), which is how the actual required flag
+(`tool_config.include_server_side_tool_invocations=True`) was found.
+Confirmed empirically that a server-side tool's response parts never
+populate `.function_call`, so they can't collide with the existing
+function-calling loop — this was verified before shipping, not assumed.
+
+The system prompt has the agent prefer `search_literature` (the local
+vault) first for biosensor literature specifically — it's cached and
+gives a `paper_id` `analyze_literature_figures` can use — and reach for
+`google_search`/`url_context` when the vault comes up short or the
+researcher wants something PubMed/arXiv don't index at all (manufacturer
+datasheets, other journals, a pasted link). Every citation, from either
+source, must include the real URL inline, not just a name — addresses
+both "give me the actual paper" and "search beyond just PubMed/arXiv."
+
+## Adding a new QC algorithm: what got built, and what deliberately didn't
+
+The pipeline had batch-level, unsupervised outlier detection for photos
+(`compare_to_batch_reference`, SSIM against a pixel-average reference)
+but nothing equivalent for the electrical measurements themselves —
+`compare_cv_to_batch_reference` closes that gap using data that's
+already being collected (no new measurement or file format), via a
+modified z-score on median + median absolute deviation (MAD) rather
+than mean/stddev — standard practice for outlier detection on real QC
+data (Iglewicz & Hoaglin, 1993), because a couple of genuine outliers
+inflate a mean/stddev calculation (the very spread being used to judge
+them), which can mask them; median/MAD are robust to exactly that.
+Validated against this project's real accumulated data before shipping,
+not just unit-tested: it independently found a real signal a fixed-
+threshold check would miss — one electrode in batch 20260805 had
+scan-to-scan ΔEp variability (`delta_ep_cv_pct`) about 9x every other
+electrode in its batch (~6.3% vs. ~0.7-1.4%), still well under
+`analyze_cv_stability`'s own fixed 15% "unstable" threshold in absolute
+terms, but a clear outlier *relative to its own batch*.
+
+Two other candidate algorithms were deliberately not built, and it's
+worth stating why rather than silently skipping them: **scan-rate-
+dependent kinetics** (Randles-Ševčík, Laviron, Nicholson's k⁰ method)
+would need CVs at multiple scan rates per electrode, and this lab's
+protocol collects repeated scans at one fixed rate instead — building
+that analysis would produce numbers with no real data behind them.
+**A time-series drift/SPC control-chart check** across a batch's print
+run was considered too, but `qc_history`'s `date` field is per-day, not
+a genuine print-order sequence, so there's no real ordering to test a
+trend against yet. Both would need a data-collection change (varying
+scan rate; recording actual print sequence) before they'd be honest —
+that's a fabrication-protocol conversation with the lab, not a code
+change, and is noted here so it isn't silently forgotten.
 
 ## What makes this approach distinctive
 
@@ -96,7 +167,18 @@ loaded from `.env` locally or from Streamlit's secrets manager when hosted.
   it correctly — a carryover from the original local 8B/7B-model
   version, where the same gap was more frequent, but kept here as
   defense-in-depth rather than removed now that the backend is a
-  stronger model.
+  stronger model. On top of that: temperature is tuned low (0.1) and
+  the system prompt requires every derived number (a ratio, a
+  percentage, anything the model computes itself rather than reads
+  directly off a tool) to show its source values and arithmetic, plus
+  an explicit self-check pass before the final answer is sent — every
+  number/status/citation should trace to a specific tool call, or get
+  removed/flagged as inference. None of this makes hallucination
+  literally impossible for an LLM-based system (no honest claim can);
+  what it does is make every claim independently checkable — the GUI's
+  per-tool-call result panels (and the CLI's printed tool calls) show
+  the exact source data, so anything that slips through is verifiable,
+  not just a stated caveat.
 - **Physical identity modeling matches how the lab actually generates
   data**, rather than assuming one clean convention: a single photo
   frame can contain multiple distinct sub-electrodes, a batch date can

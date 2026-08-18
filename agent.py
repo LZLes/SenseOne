@@ -30,6 +30,7 @@ from tools.image_qc import qc_sensor_image, IMAGE_QC_SCHEMA
 from tools.ca_calibration import analyze_ca_calibration, CA_CALIBRATION_SCHEMA
 from tools.literature_figures import analyze_literature_figures, LITERATURE_FIGURES_SCHEMA
 from tools.reference_diff import compare_to_batch_reference, REFERENCE_DIFF_SCHEMA
+from tools.electrochem_batch_outliers import compare_cv_to_batch_reference, COMPARE_CV_TO_BATCH_SCHEMA
 from tools.vault_maintenance import (
     update_literature_vault, VAULT_MAINTENANCE_SCHEMA,
     list_vault_papers, LIST_VAULT_PAPERS_SCHEMA,
@@ -170,6 +171,21 @@ biosensor lab. You help the researcher:
      won't correct for rotation/scale differences between shots, so a
      batch with more placement variance than usual could reintroduce
      noise into the scores.
+  6b. compare_to_batch_reference only looks at photos -- for the same
+      question about electrical performance ("is this electrode's CV
+      normal for its batch", "which electrodes in this batch look
+      electrically off"), call compare_cv_to_batch_reference instead. Same
+      idea (unsupervised, no labeled examples, flags statistical outliers
+      against the batch), but on the actual CV/CA metrics -- peak current,
+      delta Ep, ipa/ipc ratio, scan-to-scan stability, CA sensitivity/R^2/LOD
+      -- already logged from sensor_qc/analyze_cv_stability/ca_calibration,
+      not pixels. These two tools answer different questions and neither
+      substitutes for the other: an electrode can look visually normal but
+      be an electrical outlier, or vice versa -- if the researcher cares
+      about both, call both rather than assuming one implies the other.
+      Needs at least 5 electrodes in the batch sharing a metric before the
+      statistics mean anything (reports "insufficient_data" plainly below
+      that, not a guess). Omit electrode_code for a batch-wide sweep.
   7. You cannot browse the vault directly -- search_literature only
      surfaces papers matching a specific query. Call list_vault_papers
      when asked what's in the vault, or to find a paper_id without
@@ -287,6 +303,7 @@ result, not a recap of how you got there.
 
 TOOLS = [
     SENSOR_QC_SCHEMA, CV_STABILITY_SCHEMA, IMAGE_QC_SCHEMA, CA_CALIBRATION_SCHEMA, REFERENCE_DIFF_SCHEMA,
+    COMPARE_CV_TO_BATCH_SCHEMA,
     LITERATURE_FIGURES_SCHEMA, LITERATURE_SCHEMA, VAULT_MAINTENANCE_SCHEMA, LIST_VAULT_PAPERS_SCHEMA,
     GET_ELECTRODE_NOTE_SCHEMA, ADD_ELECTRODE_NOTE_SCHEMA, LIST_ELECTRODE_NOTES_SCHEMA, GET_BATCH_DIGEST_SCHEMA,
     SET_BATCH_METADATA_SCHEMA, GET_BATCH_METADATA_SCHEMA,
@@ -299,6 +316,7 @@ AVAILABLE_FUNCTIONS = {
     "image_qc": qc_sensor_image,
     "ca_calibration": analyze_ca_calibration,
     "compare_to_batch_reference": compare_to_batch_reference,
+    "compare_cv_to_batch_reference": compare_cv_to_batch_reference,
     "analyze_literature_figures": analyze_literature_figures,
     "search_literature": search_literature,
     "update_literature_vault": update_literature_vault,
