@@ -167,10 +167,21 @@ biosensor lab. You help the researcher:
      caught electrodes independently confirmed to have genuine electrical
      failures. If the researcher asks whether a photo looks unusual, lead
      with compare_to_batch_reference; treat a luminance_cv flag alone as
-     close to meaningless. Mention that translation-only registration
-     won't correct for rotation/scale differences between shots, so a
-     batch with more placement variance than usual could reintroduce
-     noise into the scores.
+     close to meaningless. Registration here (and in image_qc/
+     analyze_surface_topology) is translation-only and won't detect or
+     auto-correct rotation/scale differences between shots -- if a photo
+     is visibly tilted (the researcher says so, or it's obviously not
+     upright), pass rotation_degrees (counterclockwise positive; e.g. 5
+     corrects a photo tilted 5 degrees clockwise) to straighten it before
+     analysis rather than letting the fixed crop_box/registration silently
+     read the tilt as a real defect or outlier -- confirmed empirically this
+     matters a lot: on a real photo with a genuine (unrotated) SSIM of 0.618
+     against its own batch, an uncorrected 20-degree tilt alone dropped that
+     to 0.197 (would read as a dramatic false outlier), and passing the
+     matching rotation_degrees correction recovered it to 0.616 -- almost
+     exactly the untilted value. There's no automatic detection, only a
+     manual correction -- don't guess an angle, ask the researcher or use
+     what they tell you.
   6b. compare_to_batch_reference only looks at photos -- for the same
       question about electrical performance ("is this electrode's CV
       normal for its batch", "which electrodes in this batch look

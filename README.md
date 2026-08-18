@@ -127,6 +127,15 @@ you> Does A1 look unusual compared to the rest of its batch?
   a per-pixel average across a batch and reports how much one
   electrode's print deviates from it (SSIM + percentile), no labeled
   examples needed.
+- If a photo is visibly tilted (say so, or the electrode clearly isn't
+  upright in frame), both tools accept `rotation_degrees` to straighten
+  it before analysis — batch registration and the fixed crop boxes are
+  translation-only and don't auto-correct rotation, and an uncorrected
+  tilt can read as a false defect/outlier (confirmed: a 20° uncorrected
+  tilt dropped a real photo's SSIM from 0.618 to 0.197 — corrected, it
+  recovered to 0.616). Counterclockwise positive: `rotation_degrees=5`
+  corrects a photo tilted 5° clockwise. No automatic angle detection —
+  it only applies a correction you (or the researcher) specify.
 - If you ask about a grid position with no photo on file, it'll
   substitute the nearest photographed neighbor and tell you plainly
   that's what happened.

@@ -25,6 +25,13 @@ Each image is now registered (translation-only phase cross-correlation)
 against the batch average before comparison, in two passes -- align to an
 arbitrary first image, re-align to the resulting preliminary average -- and
 a margin is trimmed post-alignment to drop shift-induced edge artifacts.
+Translation-only means an actual rotation (not just a shift) between shots
+still isn't auto-corrected -- confirmed to matter a lot in practice (an
+uncorrected 20-degree tilt on a real photo dropped its SSIM from a genuine
+0.618 to 0.197, i.e. a false outlier flag purely from orientation). Pass
+rotation_degrees to manually straighten a known-tilted target photo before
+it's compared -- there's no automatic angle detection, so a wrong or guessed
+value would silently make things worse, not better.
 
 Which batch/sheet(s) a photo compares against, by default: if the caller
 gives image_dir/batch explicitly, the average is built from that one
@@ -160,6 +167,17 @@ REFERENCE_DIFF_SCHEMA = {
                 "force_rebuild": {
                     "type": "boolean",
                     "description": "Recompute the reference average instead of using the cached one. Default false.",
+                },
+                "rotation_degrees": {
+                    "type": "number",
+                    "description": (
+                        "Straighten this specific target photo before comparing, counterclockwise "
+                        "positive (e.g. 5 corrects a photo rotated 5 degrees clockwise) -- only "
+                        "applies to the photo being checked, not the batch reference average it's "
+                        "compared against. Registration here is translation-only, so a meaningfully "
+                        "tilted photo (not just shifted) will otherwise read as more different from "
+                        "the reference than it really is. Default 0 (no rotation)."
+                    ),
                 },
             },
         },
@@ -297,6 +315,7 @@ def compare_to_batch_reference(
     sheet: str = None,
     crop_box=DEFAULT_CROP_BOX,
     force_rebuild: bool = False,
+    rotation_degrees: float = 0.0,
 ) -> dict:
     # batch is a tolerated alias for image_dir -- the model has repeatedly
     # passed a bare batch string (matching the convention every OTHER tool
@@ -388,7 +407,11 @@ def compare_to_batch_reference(
     mean_img, align_reference, batch_scores = reference["mean"], reference["align_reference"], reference["scores"]
 
     try:
-        target_raw = _luminance_grid(image_path, GRID_SIZE, True, 1.0, crop_box)
+        # rotation_degrees applies only to this target image, not the
+        # reference pool built above -- it corrects one photo (e.g. a
+        # researcher's own tilted upload), not a uniform correction across a
+        # whole batch of otherwise-consistent cataloged photos.
+        target_raw = _luminance_grid(image_path, GRID_SIZE, True, 1.0, crop_box, rotation_degrees)
     except ValueError as e:
         return {"status": "error", "message": str(e)}
     target = _trim_margin(_align(target_raw, align_reference))  # same registration as the reference average

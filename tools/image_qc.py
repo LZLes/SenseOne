@@ -24,6 +24,7 @@ un-calibrated heuristic (see analyze_surface_topology docstring) meant to
 complement, not replace, the vision model's defect read.
 """
 
+import io
 import json
 import re
 from pathlib import Path
@@ -141,6 +142,18 @@ IMAGE_QC_SCHEMA = {
                         "instead, which selects the right sub-electrode's disc automatically. Pass "
                         "[0,0,1,1] for the full, un-cropped frame, or your own box for a differently "
                         "framed batch."
+                    ),
+                },
+                "rotation_degrees": {
+                    "type": "number",
+                    "description": (
+                        "Straighten a tilted photo before any analysis, counterclockwise positive "
+                        "(e.g. 5 corrects a photo rotated 5 degrees clockwise). Use when the "
+                        "researcher mentions the shot is tilted, or the electrode is visibly not "
+                        "upright in the frame -- crop_box's fractions assume an upright framing, so "
+                        "a meaningfully tilted photo needs this or the fixed box can clip the disc "
+                        "or catch the wrong region. Applies to both the vision defect read and "
+                        "include_surface_analysis. Default 0 (no rotation)."
                     ),
                 },
             },
@@ -315,6 +328,25 @@ def _validate_crop_box(crop_box):
     return (left, top, right, bottom)
 
 
+def _validate_rotation(rotation_degrees) -> float:
+    """Returns a float in (-180, 180], or raises ValueError. rotation_degrees
+    is LLM-suppliable -- without a type/range check, a bad value would
+    either crash inside PIL with a confusing error or (for something like
+    NaN) silently produce a garbage rotation.
+    """
+    try:
+        deg = float(rotation_degrees)
+    except (TypeError, ValueError):
+        raise ValueError(f"rotation_degrees must be a number, got {rotation_degrees!r}.")
+    if not np.isfinite(deg):
+        raise ValueError(f"rotation_degrees must be finite, got {rotation_degrees!r}.")
+    # Normalize into (-180, 180] rather than reject an out-of-range value --
+    # a researcher saying "rotate 370" or "-450" clearly means the
+    # equivalent angle, not an error.
+    deg = ((deg + 180) % 360) - 180
+    return deg
+
+
 def _enhance_contrast(arr: np.ndarray, saturate_pct: float) -> np.ndarray:
     """ImageJ Enhance-Contrast-style stretch: clip the extreme saturate_pct%
     of pixels at each end, then linearly rescale the rest to fill 0-255.
@@ -409,9 +441,23 @@ def _luminance_grid(
     enhance_contrast: bool = True,
     saturate_pct: float = 1.0,
     crop_box=None,
+    rotation_degrees: float = 0.0,
 ) -> np.ndarray:
     crop_box = _validate_crop_box(crop_box)
+    rotation_degrees = _validate_rotation(rotation_degrees)
     img = Image.open(image_path).convert("L")  # 8-bit, ITU-R 601-2 luminance (~ImageJ's weighted conversion)
+    if rotation_degrees:
+        # Rotated around center, same canvas size (expand=False) -- crop_box
+        # is a fraction of *this* frame, tuned assuming an upright framing,
+        # so the canvas has to stay the same size/origin for those fractions
+        # to still land on the disc after straightening a tilted shot.
+        # Corners the rotation exposes are filled with the frame's own mean
+        # luminance (not black) so they don't inject a fake sharp edge into
+        # the height map if they fall inside the crop region.
+        fill = int(round(float(np.asarray(img, dtype=float).mean())))
+        # PIL's rotate() is already counterclockwise-positive, matching the
+        # documented convention directly -- no sign flip needed here.
+        img = img.rotate(rotation_degrees, resample=Image.BICUBIC, expand=False, fillcolor=fill)
     if crop_box is not None:
         w0, h0 = img.size
         left, top, right, bottom = crop_box
@@ -516,6 +562,7 @@ def analyze_surface_topology(
     enhance_contrast: bool = True,
     contrast_saturate_pct: float = 1.0,
     crop_box=WORKING_ELECTRODE_CROP_BOX,
+    rotation_degrees: float = 0.0,
 ) -> dict:
     """ImageJ-style surface plot: pixel luminance (8-bit, contrast-enhanced,
     cropped to just the working electrode's disc -- not the counter-electrode
@@ -523,6 +570,12 @@ def analyze_surface_topology(
     surface and reports roughness metrics -- an evenly-inked print should
     read as fairly flat; texture/streaking/isolated spikes (missed ink,
     contamination, glare) inflate the variance.
+
+    rotation_degrees straightens a tilted shot (counterclockwise positive,
+    e.g. rotation_degrees=5 corrects a photo that's rotated 5 degrees
+    clockwise) before crop_box is applied -- crop_box's fractions assume an
+    upright framing, so a meaningfully tilted photo needs this or the fixed
+    box can clip the disc or catch background/ring instead.
 
     Caveats, since this is a first pass and not a validated QC method:
       - Luminance responds to lighting/glare as much as to the print itself,
@@ -562,7 +615,7 @@ def analyze_surface_topology(
     if error:
         return {"status": "error", "message": error}
     try:
-        luminance = _luminance_grid(image_path, grid_size, enhance_contrast, contrast_saturate_pct, crop_box)
+        luminance = _luminance_grid(image_path, grid_size, enhance_contrast, contrast_saturate_pct, crop_box, rotation_degrees)
     except ValueError as e:
         return {"status": "error", "message": str(e)}
     mean_l = float(np.mean(luminance))
@@ -609,6 +662,7 @@ def qc_sensor_image(
     surface_enhance_contrast: bool = True,
     surface_contrast_saturate_pct: float = 1.0,
     surface_crop_box: list = None,
+    rotation_degrees: float = 0.0,
 ) -> dict:
     # batch is a tolerated alias for image_dir -- see compare_to_batch_reference
     # for why: the model has repeatedly passed a bare batch string instead
@@ -641,16 +695,36 @@ def qc_sensor_image(
     error = _validate_image_file(image_path)
     if error:
         return {"status": "error", "message": error}
+    try:
+        rotation_degrees = _validate_rotation(rotation_degrees)
+    except ValueError as e:
+        return {"status": "error", "message": str(e)}
 
     context_line = f"\nAdditional context: {context}\n" if context else ""
     prompt = _PROMPT_TEMPLATE.format(context_line=context_line)
 
     mime_type = _MIME_TYPES.get(Path(image_path).suffix.lower(), "image/jpeg")
+    if rotation_degrees:
+        # expand=True here (unlike analyze_surface_topology's expand=False)
+        # -- the vision read doesn't depend on a fixed fractional crop_box,
+        # so there's no reason to lose corners to a fixed canvas size; show
+        # the model the full straightened frame instead.
+        with Image.open(image_path) as src:
+            # PIL's rotate() is already counterclockwise-positive, matching
+            # the documented convention directly -- no sign flip needed here.
+            rotated = src.convert("RGB").rotate(rotation_degrees, resample=Image.BICUBIC, expand=True)
+            buf = io.BytesIO()
+            rotated.save(buf, format="JPEG", quality=95)
+            image_bytes = buf.getvalue()
+        mime_type = "image/jpeg"  # re-encoded regardless of the original format
+    else:
+        image_bytes = Path(image_path).read_bytes()
+
     try:
         with request_slot():
             response = client().models.generate_content(
                 model=MODEL,
-                contents=[prompt, types.Part.from_bytes(data=Path(image_path).read_bytes(), mime_type=mime_type)],
+                contents=[prompt, types.Part.from_bytes(data=image_bytes, mime_type=mime_type)],
                 config=types.GenerateContentConfig(response_mime_type="application/json"),
             )
         content = response.text
@@ -671,6 +745,8 @@ def qc_sensor_image(
     parsed.setdefault("defects", [])
     parsed.setdefault("notes", "")
     parsed["image_path"] = image_path
+    if rotation_degrees:
+        parsed["rotation_degrees_applied"] = rotation_degrees
 
     if proxy_info:
         parsed.update(proxy_info)
@@ -689,6 +765,7 @@ def qc_sensor_image(
             surface = analyze_surface_topology(
                 image_path, surface_grid_size, max_luminance_cv,
                 surface_enhance_contrast, surface_contrast_saturate_pct, surface_crop_box,
+                rotation_degrees,
             )
         parsed["surface_analysis"] = surface
         if surface.get("status") == "error":
