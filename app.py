@@ -646,6 +646,36 @@ def guide_page() -> None:
             "always cited, never a generic \"try a different ink\" guess."
         )
 
+    st.header("How the agent actually works")
+    st.markdown(
+        "SenseOne is a **tool-calling agent**, not a fixed pipeline or a fine-tuned model -- "
+        f"there's no hardcoded \"if photo, do X\" logic. A single Gemini model "
+        f"(`{agent.MODEL}`) reads your message, decides for itself which of "
+        f"{len(agent.TOOLS)} tools it actually needs (and in what order), calls them, reads the "
+        "results, and either calls more tools or answers. That loop can run several rounds in "
+        "one turn -- e.g. checking a photo's framing, then reading its defects, then pulling up "
+        "the batch's fabrication metadata to explain *why* a defect might have happened, then "
+        "searching the literature for a fix -- all before it writes a single word back to you. "
+        "It stops once it has no more tool calls left to make, or after a hop-count safety cap "
+        "if something goes wrong (protects the shared API quota from a runaway loop)."
+    )
+    st.markdown(
+        "**Nothing is hidden.** Every tool call streams into its own expandable panel in the "
+        "chat -- the exact arguments sent and the exact result returned, before the final answer "
+        "even appears. If you ever want to know where a number came from, that panel is where it "
+        "actually is; the agent is instructed to trace every number, status, and citation in its "
+        "final answer back to one of those calls, or flag it plainly as its own inference instead "
+        "of stating it as fact. You can also toggle on \"Show reasoning\" in the sidebar to watch "
+        "its visible thinking before it commits to an answer."
+    )
+    st.markdown(
+        "**Some of this is automatic and deliberately invisible until it matters.** Every photo, "
+        "for instance, silently goes through the framing-quality gate described below as the "
+        "*first* step of any photo tool -- you never call that check yourself; a bad photo just "
+        "gets rejected with a specific reason before any analysis is attempted, rather than "
+        "quietly producing a guess from unusable input."
+    )
+
     st.header("Uploading a photo")
     st.markdown(
         "Every photo goes through an automatic framing check before any analysis happens -- a "
