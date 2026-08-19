@@ -590,8 +590,120 @@ def dashboard_page() -> None:
     dashboard_ui.render_batch_dashboard_page()
 
 
+def guide_page() -> None:
+    st.title("\U0001f4d6 User Guide")
+
+    st.header("Why this exists")
+    st.markdown(
+        "Screen-printed electrodes (SPEs) for electrochemical biosensors are normally QC'd by "
+        "actually running them -- cyclic voltammetry (CV) and chronoamperometry (CA) -- which "
+        "costs real bench time (potentiostat time, reagents, sample) per electrode. That's the "
+        "ground-truth signal, but it's slow, and it happens *after* fabrication, when a bad print "
+        "can no longer be caught cheaply.\n\n"
+        "SenseOne is built around a faster signal that's available before any electrochemistry "
+        "runs at all: a photo of the printed electrode. The open question is whether that photo "
+        "actually predicts electrical performance -- do defects, ink coverage, or surface "
+        "roughness visible in a photo correlate with CV peak behavior -- and if so, by how much, "
+        "starting from how little data. It's also a lab record-keeper: raw CV/CA exports, "
+        "electrode photos, fabrication notes, and literature accumulate across sessions in a way "
+        "that's easy to lose track of by hand."
+    )
+
+    st.header("What it can do")
+    cols = st.columns(3)
+    with cols[0]:
+        st.markdown(
+            "**QC electrochemical data**\n\n"
+            "Point it at a CV/CA/SWV CSV export -- peak current, ΔEp, noise, LOD, sensitivity, "
+            "scan-to-scan stability."
+        )
+        st.markdown(
+            "**QC electrode photos**\n\n"
+            "Vision-model defect read, plus a luminance-based surface roughness proxy, plus "
+            "unsupervised outlier detection against the rest of the batch."
+        )
+    with cols[1]:
+        st.markdown(
+            "**Predict performance**\n\n"
+            "Correlates visual features against CV outcomes, and only asserts a real prediction "
+            "once that correlation clears statistical significance -- otherwise it says so, "
+            "explicitly, rather than guessing."
+        )
+        st.markdown(
+            "**Remember, automatically**\n\n"
+            "Every QC check writes a per-electrode/per-batch record without being asked, so "
+            "history is there next session -- no manual logging."
+        )
+    with cols[2]:
+        st.markdown(
+            "**Search the literature**\n\n"
+            "Local vault (PubMed/arXiv, cached, open-access prioritized) plus live web search, "
+            "with a real clickable citation on every claim."
+        )
+        st.markdown(
+            "**Suggest next steps**\n\n"
+            "When a QC check flags something, it can pull literature-backed remediation ideas -- "
+            "always cited, never a generic \"try a different ink\" guess."
+        )
+
+    st.header("Uploading a photo")
+    st.markdown(
+        "Every photo goes through an automatic framing check before any analysis happens -- a "
+        "photo that fails is rejected outright with a specific reason, not silently guessed at. "
+        "For it to pass:"
+    )
+    st.markdown(
+        "- **One electrode, correctly identified as one** -- a real SPE strip, not a batch sheet, "
+        "a design mockup, or something else entirely\n"
+        "- **Front side up** -- printed conductive pads clearly visible, not the blank/reverse side\n"
+        "- **In focus and well-lit** -- not blurry, not too dark, no blown-out glare\n"
+        "- **Centered in frame**, not cut off at the edges\n"
+        "- **At least 640×480px** -- not a thumbnail or heavily downscaled export\n"
+        "- **Undamaged and untampered** -- no visible cuts, gouges, or foreign objects on the strip\n"
+        "- **Not overlapping another electrode**, and not mixed with a different electrode design "
+        "in the same frame"
+    )
+    st.caption(
+        "If a photo is rejected, the message says exactly which of these failed and how to "
+        "retake it -- the electrode simply isn't analyzed rather than guessed at from a bad photo."
+    )
+
+    st.header("How to ask")
+    st.markdown(
+        "Talk to it like a lab colleague, not a command line -- it figures out which tool(s) a "
+        "question needs. A few examples:"
+    )
+    st.code(
+        "Run QC on reference_data/20260707_cv/707-A1-1.csv\n"
+        "Does this photo look unusual compared to the rest of batch 20260707?\n"
+        "What does the literature say about improving ink adhesion on flexible substrates?\n"
+        "Is electrode A5's roughness related to its CV peak current at all?",
+        language=None,
+    )
+    st.markdown(
+        "Attach a photo via the uploader in the sidebar, then mention it in your message -- it's "
+        "attached to your next turn automatically. Every tool call it makes along the way is "
+        "shown in an expandable panel with the exact arguments and result, so any number in the "
+        "final answer can be traced back to where it actually came from."
+    )
+
+    st.header("Worth knowing")
+    st.markdown(
+        "- **Predictions are gated on real statistics.** A \"preliminary\" result means the "
+        "correlation isn't statistically significant yet with the data collected so far -- not "
+        "that the tool is unsure how to phrase it.\n"
+        "- **Roughness is a luminance proxy**, not calibrated physical roughness -- useful for "
+        "comparing electrodes to each other, not as an absolute spec.\n"
+        "- **This runs on a shared hosted API key.** During a busy demo you may occasionally see "
+        "a rate-limit warning -- wait a few seconds and retry.\n"
+        "- Check the **Batch Dashboard** tab for an at-a-glance pass/fail view of an entire batch "
+        "without spending a model call."
+    )
+
+
 pg = st.navigation([
     st.Page(chat_page, title="Chat", icon="\U0001f4ac", default=True),
     st.Page(dashboard_page, title="Batch Dashboard", icon="\U0001f4ca"),
+    st.Page(guide_page, title="User Guide", icon="\U0001f4d6"),
 ])
 pg.run()
