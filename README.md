@@ -239,7 +239,10 @@ you> Update the literature vault
 
 ## GUI features (Streamlit)
 
-Beyond chat, the sidebar has:
+Two pages (sidebar page picker, top of the nav): **Chat** and **Batch
+Dashboard**.
+
+Beyond chat, the Chat page's sidebar has:
 
 - **Advanced settings** — temperature (default 0.1, tuned low for
   grounded answers — the system prompt assumes this baseline), a "show
@@ -253,6 +256,18 @@ Beyond chat, the sidebar has:
   starts streaming.
 - A failed turn offers a one-click **Retry** instead of asking you to
   retype the message.
+- Tool-call results render as status badges + metric cards (not a raw
+  JSON blob) for the tools that return structured QC metrics
+  (`sensor_qc`, `analyze_cv_stability`, `ca_calibration`, `image_qc`,
+  `compare_to_batch_reference`, `compare_cv_to_batch_reference`) — the
+  full raw JSON is still one click away in a "raw result" expander for
+  anything the card view doesn't show (see `dashboard_ui.py`).
+
+**Batch Dashboard** is a separate, deterministic page (no model call,
+no API cost) — pick a batch and see pass/fail counts, fabrication
+metadata per sheet, an electrochemical outlier sweep
+(`compare_cv_to_batch_reference`), and a color-coded per-electrode
+status grid, all read directly from `electrode_notes/`.
 
 ## Deploying to Streamlit Community Cloud
 
@@ -310,7 +325,8 @@ Several layers specifically protect a live, multi-visitor demo:
 
 ```
 agent.py                    # CLI chat loop -- system prompt, tool registry, orchestration
-app.py                      # Streamlit GUI -- same tools, adds upload + live thinking + inline images
+app.py                      # Streamlit GUI -- Chat + Batch Dashboard pages (st.navigation)
+dashboard_ui.py              # dashboard-style tool-result rendering + the Batch Dashboard page
 .streamlit/config.toml      # upload-size caps, hides error details (repo/app are public)
 tools/
   _gemini.py                    # shared Gemini client, request concurrency cap, retry/timeout config

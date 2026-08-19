@@ -26,6 +26,7 @@ from google.genai import types
 from PIL import Image
 
 import agent
+import dashboard_ui
 
 UPLOAD_DIR = Path("uploads")
 MAX_UPLOAD_BYTES = 15 * 1024 * 1024  # keep in sync with .streamlit/config.toml's server.maxUploadSize
@@ -87,8 +88,23 @@ def _render_tool_call(call, result_str, collected_images):
             result = None
 
         if isinstance(result, dict):
-            st.caption("result")
-            st.json(result)
+            renderer = dashboard_ui.DASHBOARD_RENDERERS.get(name)
+            if renderer is not None:
+                try:
+                    renderer(result)
+                except Exception:
+                    # Dashboard rendering is a presentation nicety on top of
+                    # the real result -- a formatting bug in it (e.g. an
+                    # unexpected field shape) should never hide the actual
+                    # QC data, so fall through to the plain JSON view below.
+                    st.caption("result")
+                    st.json(result)
+                else:
+                    with st.expander("raw result"):
+                        st.json(result)
+            else:
+                st.caption("result")
+                st.json(result)
             images = _find_image_paths(result)
             collected_images.extend(images)
             status.update(label=f"\U0001f527 {name} -- {result.get('status', 'done')}", state="complete")
@@ -260,24 +276,7 @@ def _stream_turn(
     return stop_text, True
 
 
-if "contents" not in st.session_state:
-    st.session_state.contents = []
-if "turn_images" not in st.session_state:
-    st.session_state.turn_images = {}  # contents index -> [(label, path), ...]
-if "uploader_key" not in st.session_state:
-    st.session_state.uploader_key = 0
-if "pending_upload_path" not in st.session_state:
-    st.session_state.pending_upload_path = None
-if "session_id" not in st.session_state:
-    # Scopes this session's uploads to their own subfolder so two visitors
-    # (e.g. two judges) uploading a same-named file (very plausible --
-    # "photo.jpg" straight off a phone) never silently overwrite each other.
-    st.session_state.session_id = uuid.uuid4().hex[:8]
-if "message_timestamps" not in st.session_state:
-    st.session_state.message_timestamps = []
-if "retry_pending" not in st.session_state:
-    st.session_state.retry_pending = None  # (display_text, model_text, caption) of the last failed turn, or None
-
+MAX_MESSAGE_CHARS = 4000  # a runaway paste shouldn't be able to single-handedly burn a big chunk of shared quota
 RATE_LIMIT_WINDOW_S = 60
 RATE_LIMIT_MAX_MESSAGES = 10  # generous for real use, tight enough to blunt a script hammering the public URL
 MAX_UPLOADS_PER_SESSION = 15  # caps disk use if someone uploads many files in one session
@@ -297,180 +296,207 @@ def _rate_limited() -> str:
         return f"Sending messages a little fast -- please wait about {max(1, int(wait))}s (keeps the shared demo responsive for everyone else too)."
     return ""
 
-with st.sidebar:
-    st.header("SenseOne")
-    st.caption(f"model: `{agent.MODEL}` (Gemini API)")
-    if not agent.api_key_configured():
-        st.error(
-            "GEMINI_API_KEY is not set -- see README for setup "
-            "(local: `.env`/`export`; hosted: Streamlit's Secrets manager)."
-        )
-    col_new, col_check = st.columns(2)
-    if col_new.button("New conversation"):
+
+def chat_page() -> None:
+    if "contents" not in st.session_state:
         st.session_state.contents = []
-        st.session_state.turn_images = {}
-        st.session_state.retry_pending = None
-        st.rerun()
-    if col_check.button("\U0001f50c Check connection", help="Sends one small test request to confirm the API key/quota are actually working -- worth a click right before demoing."):
+    if "turn_images" not in st.session_state:
+        st.session_state.turn_images = {}  # contents index -> [(label, path), ...]
+    if "uploader_key" not in st.session_state:
+        st.session_state.uploader_key = 0
+    if "pending_upload_path" not in st.session_state:
+        st.session_state.pending_upload_path = None
+    if "session_id" not in st.session_state:
+        # Scopes this session's uploads to their own subfolder so two visitors
+        # (e.g. two judges) uploading a same-named file (very plausible --
+        # "photo.jpg" straight off a phone) never silently overwrite each other.
+        st.session_state.session_id = uuid.uuid4().hex[:8]
+    if "message_timestamps" not in st.session_state:
+        st.session_state.message_timestamps = []
+    if "retry_pending" not in st.session_state:
+        st.session_state.retry_pending = None  # (display_text, model_text, caption) of the last failed turn, or None
+
+    with st.sidebar:
+        st.header("SenseOne")
+        st.caption(f"model: `{agent.MODEL}` (Gemini API)")
         if not agent.api_key_configured():
-            st.error("No API key configured.")
-        else:
-            with st.spinner("Pinging Gemini..."):
-                try:
-                    with agent.request_slot():
-                        probe = agent.client().models.generate_content(
-                            model=agent.MODEL, contents="Reply with exactly one word: OK",
-                            config=types.GenerateContentConfig(temperature=0, thinking_config=types.ThinkingConfig(include_thoughts=False)),
-                        )
-                    if probe.text and "OK" in probe.text.upper():
-                        st.success(f"Connected -- {agent.MODEL} responded normally.")
-                    else:
-                        st.warning(f"Got a response, but unexpected content: {probe.text!r}")
-                except Exception as e:
-                    st.error(f"Connection check failed: {e}")
-
-    with st.expander("⚙️ Advanced settings"):
-        temperature = st.slider(
-            "Temperature", 0.0, 1.0, agent.DEFAULT_TEMPERATURE, 0.05,
-            help=(
-                "Lower = more consistent, literal answers (recommended for QC -- "
-                f"the system prompt is tuned around the default, {agent.DEFAULT_TEMPERATURE}). "
-                "Higher = more varied phrasing, more prone to embellishing beyond what a tool actually reported."
-            ),
-        )
-        show_thinking = st.checkbox(
-            "Show reasoning", value=True,
-            help="Stream the model's visible thinking before its answer. Turn off for a cleaner, answer-only view.",
-        )
-        max_hops = st.slider(
-            "Max tool-call rounds / turn", 1, 30, agent.MAX_HOPS,
-            help="Safety cap -- stops a confused model from looping on tool calls indefinitely and burning shared API quota.",
-        )
-
-    st.divider()
-    st.caption("upload a photo")
-    uploaded = st.file_uploader(
-        "electrode photo", type=["png", "jpg", "jpeg", "bmp"],
-        key=f"uploader_{st.session_state.uploader_key}", label_visibility="collapsed",
-    )
-    if uploaded is not None:
-        data = uploaded.getvalue()
-        if len(data) > MAX_UPLOAD_BYTES:
-            st.error(f"That file is {len(data) / 1e6:.1f} MB -- max {MAX_UPLOAD_BYTES / 1e6:.0f} MB.")
-        else:
-            try:
-                # Validate the bytes are actually a decodable image before
-                # saving/using them -- the uploader's type= filter is
-                # client-side only, and this file's path eventually gets
-                # read and sent to the Gemini API as "image data" by
-                # tools/image_qc.py, so a mistyped/corrupted upload should
-                # fail here with a clear message, not deep inside a tool call.
-                with Image.open(io.BytesIO(data)) as probe:
-                    probe.verify()
-            except Exception as e:
-                st.error(f"That doesn't look like a valid image file ({e}).")
-            else:
-                session_dir = UPLOAD_DIR / st.session_state.session_id
-                session_dir.mkdir(parents=True, exist_ok=True)
-                # Cap how many files one session accumulates -- ephemeral
-                # storage on a hosted instance is finite, and nothing here
-                # ever deletes an old upload otherwise.
-                existing = sorted(session_dir.glob("*"), key=lambda p: p.stat().st_mtime)
-                for stale in existing[:max(0, len(existing) - MAX_UPLOADS_PER_SESSION + 1)]:
-                    stale.unlink(missing_ok=True)
-                # Path(...).name strips any directory components a crafted
-                # filename might carry -- never trust a browser-supplied
-                # filename as a bare relative path.
-                safe_name = Path(uploaded.name).name or "upload"
-                save_path = session_dir / safe_name
-                save_path.write_bytes(data)
-                st.session_state.pending_upload_path = str(save_path)
-                st.image(str(save_path), caption=uploaded.name, width=150)
-                st.caption(f"Will be attached to your next message as `{save_path}`.")
-
-    st.divider()
-    st.caption("batches on record")
-    img_root = Path("reference_images")
-    if img_root.exists():
-        for batch_dir in sorted(p for p in img_root.iterdir() if p.is_dir()):
-            n = len(list(batch_dir.glob("*")))
-            st.text(f"{batch_dir.name}  ({n} photos)")
-
-st.title("\U0001f52c SenseOne")
-st.caption("Gemini-backed research assistant for the electrochemical biosensor lab.")
-
-for i, content in enumerate(st.session_state.contents):
-    if content.role == "user" and not any(getattr(p, "function_response", None) for p in content.parts):
-        with st.chat_message("user"):
-            st.markdown("".join(p.text for p in content.parts if p.text))
-    elif content.role == "model" and not any(getattr(p, "function_call", None) for p in content.parts):
-        text = "".join(p.text for p in content.parts if p.text and not getattr(p, "thought", False))
-        if text:
-            with st.chat_message("assistant"):
-                st.markdown(text)
-                _render_image_gallery(st.session_state.turn_images.get(i, []))
-
-MAX_MESSAGE_CHARS = 4000  # a runaway paste shouldn't be able to single-handedly burn a big chunk of shared quota
-
-
-def _handle_turn(display_text: str, model_text: str, caption: str = None) -> None:
-    """Runs one full user turn: appends the user message, streams the
-    assistant's reply, and tracks whether it needs a retry affordance.
-    Wrapped in a last-resort try/except -- every Gemini-specific failure
-    mode is already handled inside _stream_turn, so anything that reaches
-    here is genuinely unanticipated (e.g. a rendering bug), and should never
-    surface Streamlit's raw crash page in front of a live audience.
-    """
-    st.session_state.message_timestamps.append(time.time())
-    st.session_state.contents.append(types.Content(role="user", parts=[types.Part.from_text(text=model_text)]))
-    with st.chat_message("user"):
-        st.markdown(display_text)
-        if caption:
-            st.caption(caption)
-    with st.chat_message("assistant"):
-        images = []
-        try:
-            _, failed = _stream_turn(
-                st.session_state.contents, images,
-                generate_config=agent.build_generate_config(temperature=temperature, include_thoughts=show_thinking),
-                show_thinking=show_thinking, max_hops=max_hops,
+            st.error(
+                "GEMINI_API_KEY is not set -- see README for setup "
+                "(local: `.env`/`export`; hosted: Streamlit's Secrets manager)."
             )
-        except Exception as e:
-            st.error(f"Something unexpected went wrong ({type(e).__name__}). Try \"New conversation\" if this persists.")
-            failed = True
-        _render_image_gallery(images)
-        if images:
-            # final assistant turn is the last one appended
-            st.session_state.turn_images[len(st.session_state.contents) - 1] = images
+        col_new, col_check = st.columns(2)
+        if col_new.button("New conversation"):
+            st.session_state.contents = []
+            st.session_state.turn_images = {}
+            st.session_state.retry_pending = None
+            st.rerun()
+        if col_check.button("\U0001f50c Check connection", help="Sends one small test request to confirm the API key/quota are actually working -- worth a click right before demoing."):
+            if not agent.api_key_configured():
+                st.error("No API key configured.")
+            else:
+                with st.spinner("Pinging Gemini..."):
+                    try:
+                        with agent.request_slot():
+                            probe = agent.client().models.generate_content(
+                                model=agent.MODEL, contents="Reply with exactly one word: OK",
+                                config=types.GenerateContentConfig(temperature=0, thinking_config=types.ThinkingConfig(include_thoughts=False)),
+                            )
+                        if probe.text and "OK" in probe.text.upper():
+                            st.success(f"Connected -- {agent.MODEL} responded normally.")
+                        else:
+                            st.warning(f"Got a response, but unexpected content: {probe.text!r}")
+                    except Exception as e:
+                        st.error(f"Connection check failed: {e}")
 
-    st.session_state.retry_pending = (display_text, model_text, caption) if failed else None
+        with st.expander("⚙️ Advanced settings"):
+            temperature = st.slider(
+                "Temperature", 0.0, 1.0, agent.DEFAULT_TEMPERATURE, 0.05,
+                help=(
+                    "Lower = more consistent, literal answers (recommended for QC -- "
+                    f"the system prompt is tuned around the default, {agent.DEFAULT_TEMPERATURE}). "
+                    "Higher = more varied phrasing, more prone to embellishing beyond what a tool actually reported."
+                ),
+            )
+            show_thinking = st.checkbox(
+                "Show reasoning", value=True,
+                help="Stream the model's visible thinking before its answer. Turn off for a cleaner, answer-only view.",
+            )
+            max_hops = st.slider(
+                "Max tool-call rounds / turn", 1, 30, agent.MAX_HOPS,
+                help="Safety cap -- stops a confused model from looping on tool calls indefinitely and burning shared API quota.",
+            )
 
+        st.divider()
+        st.caption("upload a photo")
+        uploaded = st.file_uploader(
+            "electrode photo", type=["png", "jpg", "jpeg", "bmp"],
+            key=f"uploader_{st.session_state.uploader_key}", label_visibility="collapsed",
+        )
+        if uploaded is not None:
+            data = uploaded.getvalue()
+            if len(data) > MAX_UPLOAD_BYTES:
+                st.error(f"That file is {len(data) / 1e6:.1f} MB -- max {MAX_UPLOAD_BYTES / 1e6:.0f} MB.")
+            else:
+                try:
+                    # Validate the bytes are actually a decodable image before
+                    # saving/using them -- the uploader's type= filter is
+                    # client-side only, and this file's path eventually gets
+                    # read and sent to the Gemini API as "image data" by
+                    # tools/image_qc.py, so a mistyped/corrupted upload should
+                    # fail here with a clear message, not deep inside a tool call.
+                    with Image.open(io.BytesIO(data)) as probe:
+                        probe.verify()
+                except Exception as e:
+                    st.error(f"That doesn't look like a valid image file ({e}).")
+                else:
+                    session_dir = UPLOAD_DIR / st.session_state.session_id
+                    session_dir.mkdir(parents=True, exist_ok=True)
+                    # Cap how many files one session accumulates -- ephemeral
+                    # storage on a hosted instance is finite, and nothing here
+                    # ever deletes an old upload otherwise.
+                    existing = sorted(session_dir.glob("*"), key=lambda p: p.stat().st_mtime)
+                    for stale in existing[:max(0, len(existing) - MAX_UPLOADS_PER_SESSION + 1)]:
+                        stale.unlink(missing_ok=True)
+                    # Path(...).name strips any directory components a crafted
+                    # filename might carry -- never trust a browser-supplied
+                    # filename as a bare relative path.
+                    safe_name = Path(uploaded.name).name or "upload"
+                    save_path = session_dir / safe_name
+                    save_path.write_bytes(data)
+                    st.session_state.pending_upload_path = str(save_path)
+                    st.image(str(save_path), caption=uploaded.name, width=150)
+                    st.caption(f"Will be attached to your next message as `{save_path}`.")
 
-rate_limit_msg = _rate_limited()
-if rate_limit_msg:
-    st.warning(rate_limit_msg)
+        st.divider()
+        st.caption("batches on record")
+        img_root = Path("reference_images")
+        if img_root.exists():
+            for batch_dir in sorted(p for p in img_root.iterdir() if p.is_dir()):
+                n = len(list(batch_dir.glob("*")))
+                st.text(f"{batch_dir.name}  ({n} photos)")
 
-if st.session_state.retry_pending:
-    retry_display, _, _ = st.session_state.retry_pending
-    label = retry_display if len(retry_display) <= 60 else retry_display[:57] + "..."
-    if st.button(f"\U0001f504 Retry: “{label}”", disabled=bool(rate_limit_msg)):
-        display_text, model_text, caption = st.session_state.retry_pending
-        st.session_state.retry_pending = None
-        _handle_turn(display_text, model_text, caption)
+    st.title("\U0001f52c SenseOne")
+    st.caption("Gemini-backed research assistant for the electrochemical biosensor lab.")
+
+    for i, content in enumerate(st.session_state.contents):
+        if content.role == "user" and not any(getattr(p, "function_response", None) for p in content.parts):
+            with st.chat_message("user"):
+                st.markdown("".join(p.text for p in content.parts if p.text))
+        elif content.role == "model" and not any(getattr(p, "function_call", None) for p in content.parts):
+            text = "".join(p.text for p in content.parts if p.text and not getattr(p, "thought", False))
+            if text:
+                with st.chat_message("assistant"):
+                    st.markdown(text)
+                    _render_image_gallery(st.session_state.turn_images.get(i, []))
+
+    def _handle_turn(display_text: str, model_text: str, caption: str = None) -> None:
+        """Runs one full user turn: appends the user message, streams the
+        assistant's reply, and tracks whether it needs a retry affordance.
+        Wrapped in a last-resort try/except -- every Gemini-specific failure
+        mode is already handled inside _stream_turn, so anything that reaches
+        here is genuinely unanticipated (e.g. a rendering bug), and should
+        never surface Streamlit's raw crash page in front of a live audience.
+        """
+        st.session_state.message_timestamps.append(time.time())
+        st.session_state.contents.append(types.Content(role="user", parts=[types.Part.from_text(text=model_text)]))
+        with st.chat_message("user"):
+            st.markdown(display_text)
+            if caption:
+                st.caption(caption)
+        with st.chat_message("assistant"):
+            images = []
+            try:
+                _, failed = _stream_turn(
+                    st.session_state.contents, images,
+                    generate_config=agent.build_generate_config(temperature=temperature, include_thoughts=show_thinking),
+                    show_thinking=show_thinking, max_hops=max_hops,
+                )
+            except Exception as e:
+                st.error(f"Something unexpected went wrong ({type(e).__name__}). Try \"New conversation\" if this persists.")
+                failed = True
+            _render_image_gallery(images)
+            if images:
+                # final assistant turn is the last one appended
+                st.session_state.turn_images[len(st.session_state.contents) - 1] = images
+
+        st.session_state.retry_pending = (display_text, model_text, caption) if failed else None
+
+    rate_limit_msg = _rate_limited()
+    if rate_limit_msg:
+        st.warning(rate_limit_msg)
+
+    if st.session_state.retry_pending:
+        retry_display, _, _ = st.session_state.retry_pending
+        label = retry_display if len(retry_display) <= 60 else retry_display[:57] + "..."
+        if st.button(f"\U0001f504 Retry: “{label}”", disabled=bool(rate_limit_msg)):
+            display_text, model_text, caption = st.session_state.retry_pending
+            st.session_state.retry_pending = None
+            _handle_turn(display_text, model_text, caption)
+            st.rerun()
+
+    user_input = st.chat_input(
+        "Ask about a sensor, image, paper, or batch..."
+        if agent.api_key_configured() else "Set GEMINI_API_KEY to start chatting (see sidebar)",
+        disabled=not agent.api_key_configured() or bool(rate_limit_msg),
+        max_chars=MAX_MESSAGE_CHARS,
+        submit_mode="disable",  # disables the input while a turn is in flight -- blocks double-submit spam on the shared key
+    )
+    if user_input:
+        pending = st.session_state.pending_upload_path
+        model_input = f"{user_input}\n\n[Uploaded image saved at: {pending}]" if pending else user_input
+        st.session_state.pending_upload_path = None
+        st.session_state.uploader_key += 1  # force a fresh, empty uploader widget so this file isn't re-attached to later messages
+
+        _handle_turn(user_input, model_input, caption=f"\U0001f4ce {pending}" if pending else None)
         st.rerun()
 
-user_input = st.chat_input(
-    "Ask about a sensor, image, paper, or batch..."
-    if agent.api_key_configured() else "Set GEMINI_API_KEY to start chatting (see sidebar)",
-    disabled=not agent.api_key_configured() or bool(rate_limit_msg),
-    max_chars=MAX_MESSAGE_CHARS,
-    submit_mode="disable",  # disables the input while a turn is in flight -- blocks double-submit spam on the shared key
-)
-if user_input:
-    pending = st.session_state.pending_upload_path
-    model_input = f"{user_input}\n\n[Uploaded image saved at: {pending}]" if pending else user_input
-    st.session_state.pending_upload_path = None
-    st.session_state.uploader_key += 1  # force a fresh, empty uploader widget so this file isn't re-attached to later messages
 
-    _handle_turn(user_input, model_input, caption=f"\U0001f4ce {pending}" if pending else None)
-    st.rerun()
+def dashboard_page() -> None:
+    dashboard_ui.render_batch_dashboard_page()
+
+
+pg = st.navigation([
+    st.Page(chat_page, title="Chat", icon="\U0001f4ac", default=True),
+    st.Page(dashboard_page, title="Batch Dashboard", icon="\U0001f4ca"),
+])
+pg.run()
