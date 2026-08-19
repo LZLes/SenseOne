@@ -32,6 +32,7 @@ from tools.image_qc import (
     WORKING_ELECTRODE_CROP_BOX, analyze_surface_topology, sub_pad_working_electrode_crop_box,
     _resolve_electrode_image,
 )
+from tools.framing_qc import check_photo_framing
 
 _VISUAL_FIELDS = ("Ra", "Rq", "Rz", "Rt", "Rsk", "Rku")
 # From sensor_qc (single-scan snapshot) and analyze_cv_stability (scan-to-scan
@@ -250,6 +251,7 @@ def predict_electrode_performance(
     # alongside an already-given image_path doesn't crash with an
     # unexpected-keyword-argument error (observed happening in practice).
     image_dir = image_dir or (f"reference_images/{batch}" if batch else "")
+    expect_single_electrode = bool(image_path)  # captured before catalog resolution can overwrite image_path
 
     if not image_path:
         if not electrode_code or not image_dir:
@@ -257,6 +259,20 @@ def predict_electrode_performance(
         image_path, _, _ = _resolve_electrode_image(electrode_code, image_dir)
         if image_path is None:
             return {"status": "error", "message": f"No grid-labeled photos found for '{electrode_code}' in {image_dir}."}
+
+    # Same framing-QC gate as image_qc/compare_to_batch_reference -- a
+    # prediction built on a bad photo's roughness reading (blurred, clipped,
+    # cut off) would carry the same false confidence as a defect read from
+    # one, just laundered through a correlation instead of stated directly.
+    framing = check_photo_framing(image_path=image_path, expect_single_electrode=expect_single_electrode)
+    if not framing["proceed"]:
+        return {
+            "status": "framing_rejected",
+            "framing_ok": False,
+            "issues": framing["issues"],
+            "user_message": framing["user_message"],
+            "measurements": framing.get("measurements"),
+        }
 
     effective_crop = (
         sub_pad_working_electrode_crop_box(sub_position) if sub_position

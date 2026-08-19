@@ -36,7 +36,7 @@ import numpy as np
 from google.genai import types
 from matplotlib.colors import LightSource
 from PIL import Image
-from scipy.ndimage import gaussian_filter
+from scipy.ndimage import gaussian_filter, label
 from scipy.stats import kurtosis, skew
 
 from tools._gemini import client, MODEL, request_slot
@@ -435,6 +435,62 @@ def sub_pad_working_electrode_crop_box(position: str, base_crop_box=DEFAULT_CROP
     return (left + (cx - rx) * sw, top + (cy - ry) * sh, left + (cx + rx) * sw, top + (cy + ry) * sh)
 
 
+CLIPPING_FRACTION_MAX = 0.20  # calibrated against real photos, see _measure_clipping docstring
+
+
+def _measure_clipping(image_path: str, crop_box, rotation_degrees: float = 0.0) -> dict:
+    """Fraction of RAW (pre-contrast-enhancement), hard-clipped (>=254 of 255)
+    pixels within the exact crop region roughness is computed from. Distinct
+    from _enhance_contrast's own percentile stretch, which deliberately pushes
+    some pixels to 0/255 as part of normal processing -- measuring clipping on
+    the enhanced output would conflate "the enhancement worked as designed"
+    with "the sensor genuinely lost information here", so this reads the crop
+    before that step, straight off the source image.
+
+    Why this matters: a clipped/saturated patch has literally zero local
+    luminance variance (it's pinned at a constant value), which the roughness
+    proxy (luminance variance standing in for surface height variance) reads
+    as an unusually FLAT/smooth surface -- indistinguishable from a genuinely
+    well-printed, even electrode by this metric alone. A print that's actually
+    fine except for a glare spot could misreport as smoother than it is; worse,
+    a genuinely rough/defective area that happens to also be overexposed could
+    read as falsely clean.
+
+    Scoped to crop_box specifically (not the whole frame) because whole-frame
+    clipping is a much noisier signal here -- confirmed empirically: hard-clip
+    fraction across the full frame reached 28% on real, good photos (the
+    reflective silver contact pads catch direct light and clip easily; that's
+    normal and outside the working-electrode disc this function is actually
+    called with). Restricted to WORKING_ELECTRODE_CROP_BOX/sub_pad_working_
+    electrode_crop_box specifically, the real max across all 189 calibration
+    photos was 9.4% -- CLIPPING_FRACTION_MAX (0.20) sits with over 2x margin
+    above that floor.
+    """
+    crop_box = _validate_crop_box(crop_box)
+    rotation_degrees = _validate_rotation(rotation_degrees)
+    img = Image.open(image_path).convert("L")
+    if rotation_degrees:
+        fill = int(round(float(np.asarray(img, dtype=float).mean())))
+        img = img.rotate(rotation_degrees, resample=Image.BICUBIC, expand=False, fillcolor=fill)
+    if crop_box is not None:
+        w0, h0 = img.size
+        left, top, right, bottom = crop_box
+        box_px = (int(left * w0), int(top * h0), int(right * w0), int(bottom * h0))
+        if box_px[2] - box_px[0] >= 2 and box_px[3] - box_px[1] >= 2:
+            img = img.crop(box_px)
+    arr = np.asarray(img, dtype=float)
+    clipped = arr >= 254
+    fraction = float(clipped.mean())
+    if clipped.any():
+        labeled, _n = label(clipped)
+        sizes = np.bincount(labeled.ravel())
+        sizes[0] = 0
+        largest_patch_fraction = float(sizes.max() / clipped.size)
+    else:
+        largest_patch_fraction = 0.0
+    return {"clipped_fraction": fraction, "largest_clipped_patch_fraction": largest_patch_fraction}
+
+
 def _luminance_grid(
     image_path: str,
     grid_size: int,
@@ -610,6 +666,16 @@ def analyze_surface_topology(
         these as a relative, photo-only proxy for comparing electrodes
         against each other under matched lighting, not as trustworthy
         absolute roughness values for a spec sheet or paper.
+      - A clipped/overexposed patch within the analyzed region corrupts
+        this metric in either direction, confirmed empirically rather than
+        assumed: a near-total clip suppresses roughness toward zero (a
+        saturated pixel has no internal variance regardless of the real
+        surface), but a *partial* clip instead roughly doubled it in
+        testing -- the sharp edge between the clipped and unclipped area
+        reads as texture on its own. Checked separately (_measure_clipping,
+        on the raw pre-contrast-enhancement crop) and flagged if more than
+        CLIPPING_FRACTION_MAX of the region is clipped -- either direction
+        alongside that flag means "can't tell", not a real measurement.
     """
     error = _validate_image_file(image_path)
     if error:
@@ -622,6 +688,7 @@ def analyze_surface_topology(
     std_l = float(np.std(luminance))
     cv = (std_l / mean_l) if mean_l > 0 else None
     roughness = _roughness_params(luminance)
+    clipping = _measure_clipping(image_path, crop_box, rotation_degrees)
 
     out_path = SURFACE_PLOTS_DIR / Path(image_path).parent.name / f"{Path(image_path).stem}_surface.png"
     _render_surface_plot(luminance, out_path, title=Path(image_path).name)
@@ -633,6 +700,29 @@ def analyze_surface_topology(
             f"(confirmed to flag ~100% of a real batch in testing); use compare_to_batch_reference "
             f"for an actually discriminating outlier check, don't treat this alone as meaningful."
         )
+    if clipping["clipped_fraction"] > CLIPPING_FRACTION_MAX:
+        # Direction of the distortion depends on how much of the region is
+        # clipped, confirmed empirically, not assumed: near-total clipping
+        # (~92% of a test crop) suppressed Ra back toward baseline -- a
+        # uniformly clipped patch has zero internal variance, reading as
+        # falsely SMOOTH. Partial clipping (~49%) instead roughly *doubled*
+        # Ra -- the boundary between the clipped and unclipped area is itself
+        # a sharp luminance step, reading as falsely ROUGH. Only the extreme
+        # (near-total) case reliably points one direction, so the flag
+        # doesn't claim a single direction -- both were observed, not assumed.
+        mostly_clipped = clipping["largest_clipped_patch_fraction"] > 0.85
+        direction = (
+            "artificially SMOOTH/flat (a near-fully clipped patch has ~zero internal variance)"
+            if mostly_clipped else
+            "artificially ROUGH (the sharp edge between the clipped and unclipped area itself reads as texture) "
+            "or artificially smooth, depending on exactly where the clip falls"
+        )
+        flags.append(
+            f"CLIPPING: {clipping['clipped_fraction']:.0%} of the analyzed region is at/near maximum "
+            f"brightness (sensor saturation, largest contiguous patch {clipping['largest_clipped_patch_fraction']:.0%}) "
+            f"-- roughness metrics below may read {direction}, not a real measurement of the surface "
+            f"underneath. Retake with less direct light/glare before trusting either direction here."
+        )
 
     return {
         "status": "warn" if flags else "pass",
@@ -641,6 +731,7 @@ def analyze_surface_topology(
             "mean_luminance": mean_l,
             "luminance_cv": cv,
         },
+        "clipping": clipping,
         # ISO-4287-style roughness parameters (Ra/Rq/Rz/Rt/Rsk/Rku), in
         # luminance units -- Rq is the same value as the old std_luminance
         # field, Rt the same as the old luminance_range field, now with
@@ -670,6 +761,12 @@ def qc_sensor_image(
     # unexpected-keyword-argument error rather than silently doing nothing.
     image_dir = image_dir or (f"reference_images/{batch}" if batch else "")
     proxy_info = {}
+    # True when the caller gave image_path directly (a researcher's own fresh
+    # upload, expected to show one electrode) rather than resolving one via
+    # electrode_code+image_dir (a catalogued grid photo, where several
+    # electrodes sharing one frame is normal) -- passed to the framing gate
+    # so it knows whether "multiple electrodes in frame" is actually a problem.
+    expect_single_electrode = bool(image_path)
 
     if not image_path:
         if not electrode_code or not image_dir:
@@ -719,6 +816,32 @@ def qc_sensor_image(
         mime_type = "image/jpeg"  # re-encoded regardless of the original format
     else:
         image_bytes = Path(image_path).read_bytes()
+
+    # Framing-QC gate: refuses to guess on an unusable photo rather than
+    # attempting a defect read anyway. Runs on these exact bytes (the
+    # already-rotated image when rotation_degrees was given) rather than
+    # re-reading image_path raw, so a manual tilt correction the caller just
+    # supplied isn't immediately re-flagged as "angled" by this same gate.
+    # Local import: framing_qc imports _validate_image_file/_MIME_TYPES from
+    # this module, so importing it back at module load time would be circular.
+    from tools.framing_qc import check_photo_framing
+    framing = check_photo_framing(image_bytes=image_bytes, mime_type=mime_type, expect_single_electrode=expect_single_electrode)
+    if not framing["proceed"]:
+        result = {
+            "status": "framing_rejected",
+            "framing_ok": False,
+            "issues": framing["issues"],
+            "user_message": framing["user_message"],
+            "defects": [],
+            "notes": "Framing check failed before defect analysis was attempted -- see user_message.",
+            "image_path": image_path,
+            "measurements": framing.get("measurements"),
+        }
+        if rotation_degrees:
+            result["rotation_degrees_applied"] = rotation_degrees
+        if proxy_info:
+            result.update(proxy_info)
+        return result
 
     try:
         with request_slot():

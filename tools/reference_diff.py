@@ -25,13 +25,17 @@ Each image is now registered (translation-only phase cross-correlation)
 against the batch average before comparison, in two passes -- align to an
 arbitrary first image, re-align to the resulting preliminary average -- and
 a margin is trimmed post-alignment to drop shift-induced edge artifacts.
-Translation-only means an actual rotation (not just a shift) between shots
-still isn't auto-corrected -- confirmed to matter a lot in practice (an
+Translation-only alignment used to leave actual rotation (not just a shift)
+between shots uncorrected -- confirmed to matter a lot in practice (an
 uncorrected 20-degree tilt on a real photo dropped its SSIM from a genuine
-0.618 to 0.197, i.e. a false outlier flag purely from orientation). Pass
-rotation_degrees to manually straighten a known-tilted target photo before
-it's compared -- there's no automatic angle detection, so a wrong or guessed
-value would silently make things worse, not better.
+0.618 to 0.197, i.e. a false outlier flag purely from orientation). The
+target image's rotation is now auto-detected against the reference before
+alignment (_estimate_rotation: a coarse-to-fine angle search on the
+downsampled luminance grid, scored by how well each candidate rotation
+aligns -- cheap, since it operates on a ~150px grid, not the full photo).
+rotation_degrees still exists as an optional manual seed for gross
+correction outside the auto-search's +-20 degree range; the auto-detected
+angle is reported in the result either way so a correction is never silent.
 
 Which batch/sheet(s) a photo compares against, by default: if the caller
 gives image_dir/batch explicitly, the average is built from that one
@@ -54,6 +58,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+from scipy.ndimage import rotate as nd_rotate
 from scipy.ndimage import shift as nd_shift
 from skimage.metrics import structural_similarity
 from skimage.registration import phase_cross_correlation
@@ -64,9 +69,10 @@ from tools.electrode_notes import (
     extract_grid_code, get_batch_metadata,
 )
 from tools.image_qc import (
-    DEFAULT_CROP_BOX, _index_grid_images, _luminance_grid, _parse_filename_identity,
+    _MIME_TYPES, DEFAULT_CROP_BOX, _index_grid_images, _luminance_grid, _parse_filename_identity,
     _resolve_electrode_image, _split_key, _validate_image_file,
 )
+from tools.framing_qc import check_photo_framing
 
 REFERENCE_DIFF_DIR = Path("reference_diff")
 GRID_SIZE = 150  # finer than image_qc's 3D-plot grid; no mesh-rendering cost to worry about here
@@ -87,6 +93,56 @@ def _match_shape(grid: np.ndarray, target_shape: tuple) -> np.ndarray:
     if grid.shape == target_shape:
         return grid
     return sk_resize(grid, target_shape, preserve_range=True, anti_aliasing=True)
+
+
+ROTATION_SEARCH_RANGE_DEG = 20.0
+ROTATION_COARSE_STEP_DEG = 2.0
+ROTATION_FINE_STEP_DEG = 0.25
+
+
+def _estimate_rotation(raw_grid: np.ndarray, reference: np.ndarray) -> float:
+    """Find the rotation (degrees) that best aligns raw_grid to reference,
+    so a photo shot slightly askew in the jig doesn't score poorly on SSIM
+    for orientation reasons that have nothing to do with print quality.
+
+    Operates on the already-downsampled luminance grid (~150px), not the
+    full-resolution photo, so a several-dozen-angle search costs
+    milliseconds rather than seconds. Coarse-to-fine: a wide sweep at
+    ROTATION_COARSE_STEP_DEG first, then a narrow refinement around the
+    best coarse angle at ROTATION_FINE_STEP_DEG -- cheaper than one dense
+    sweep and still finds the optimum between coarse steps.
+
+    +-ROTATION_SEARCH_RANGE_DEG covers a shot tilted in the jig, not an
+    arbitrary orientation (e.g. someone photographing the electrode
+    upside down) -- that failure mode hasn't been observed in practice,
+    and a full 0-360 search would cost more and risk false positives from
+    the grid's own approximate symmetry.
+    """
+    matched = _match_shape(raw_grid, reference.shape)
+
+    def score(angle: float) -> float:
+        rotated = matched if angle == 0 else nd_rotate(matched, angle, reshape=False, mode="nearest", order=1)
+        aligned = _align(rotated, reference)
+        return float(structural_similarity(aligned, reference, data_range=255))
+
+    best_angle, best_score = 0.0, score(0.0)
+    coarse_angles = np.arange(-ROTATION_SEARCH_RANGE_DEG, ROTATION_SEARCH_RANGE_DEG + ROTATION_COARSE_STEP_DEG, ROTATION_COARSE_STEP_DEG)
+    for angle in coarse_angles:
+        angle = float(angle)
+        if angle == 0.0:
+            continue
+        s = score(angle)
+        if s > best_score:
+            best_angle, best_score = angle, s
+
+    fine_angles = np.arange(best_angle - ROTATION_COARSE_STEP_DEG, best_angle + ROTATION_COARSE_STEP_DEG + ROTATION_FINE_STEP_DEG, ROTATION_FINE_STEP_DEG)
+    for angle in fine_angles:
+        angle = float(angle)
+        s = score(angle)
+        if s > best_score:
+            best_angle, best_score = angle, s
+
+    return best_angle
 
 
 def _align(grid: np.ndarray, reference: np.ndarray) -> np.ndarray:
@@ -171,12 +227,12 @@ REFERENCE_DIFF_SCHEMA = {
                 "rotation_degrees": {
                     "type": "number",
                     "description": (
-                        "Straighten this specific target photo before comparing, counterclockwise "
-                        "positive (e.g. 5 corrects a photo rotated 5 degrees clockwise) -- only "
-                        "applies to the photo being checked, not the batch reference average it's "
-                        "compared against. Registration here is translation-only, so a meaningfully "
-                        "tilted photo (not just shifted) will otherwise read as more different from "
-                        "the reference than it really is. Default 0 (no rotation)."
+                        "Usually not needed -- the tool auto-detects and corrects a tilted target "
+                        "photo's orientation against the reference before comparing (search range "
+                        "+-20 degrees). Only pass this for a manual seed on a rotation larger than "
+                        "that, or a known-exact angle you don't want auto-detection to second-guess. "
+                        "Counterclockwise positive, only applies to the photo being checked, not the "
+                        "batch reference average. Default 0."
                     ),
                 },
             },
@@ -233,13 +289,15 @@ def build_batch_reference(sources: list, cache_dir: Path, crop_box=DEFAULT_CROP_
     mean_path = cache_dir / "mean.npy"
     std_path = cache_dir / "std.npy"
     align_ref_path = cache_dir / "align_reference.npy"
+    rotation_ref_path = cache_dir / "rotation_reference.npy"
     scores_path = cache_dir / "scores.json"
 
-    if not force_rebuild and all(p.exists() for p in (mean_path, std_path, align_ref_path, scores_path)):
+    if not force_rebuild and all(p.exists() for p in (mean_path, std_path, align_ref_path, rotation_ref_path, scores_path)):
         return {
             "mean": np.load(mean_path),
             "std": np.load(std_path),
             "align_reference": np.load(align_ref_path),
+            "rotation_reference": np.load(rotation_ref_path),
             "scores": json.loads(scores_path.read_text()),
         }
 
@@ -281,6 +339,18 @@ def build_batch_reference(sources: list, cache_dir: Path, crop_box=DEFAULT_CROP_
     mean_img = np.mean(trimmed, axis=0)
     std_img = np.std(trimmed, axis=0)
 
+    # raw_grids[0], kept unaveraged and in the same frame as align_reference
+    # (see above), specifically for rotation estimation -- confirmed
+    # empirically that averaging across many photos, each with its own small
+    # uncorrected rotational jitter, smears out exactly the oriented texture
+    # a rotation search needs: searching against align_reference/mean_img
+    # picked a spurious angle nowhere near a known-injected 15-degree tilt's
+    # true correction, while searching against this single sharp photo
+    # recovered it cleanly (SSIM 0.92 at the true angle vs <0.4 five degrees
+    # off either side). Never used for the actual SSIM score, only to find
+    # the rotation angle before the real translation-alignment pass.
+    rotation_reference = raw_grids[0]
+
     scores = {
         code: float(structural_similarity(grid, mean_img, data_range=255))
         for code, grid in zip(codes, trimmed)
@@ -290,6 +360,7 @@ def build_batch_reference(sources: list, cache_dir: Path, crop_box=DEFAULT_CROP_
     np.save(mean_path, mean_img)
     np.save(std_path, std_img)
     np.save(align_ref_path, align_reference)
+    np.save(rotation_ref_path, rotation_reference)
     scores_path.write_text(json.dumps(scores, indent=2))
 
     fig, ax = plt.subplots(figsize=(5, 5))
@@ -299,7 +370,10 @@ def build_batch_reference(sources: list, cache_dir: Path, crop_box=DEFAULT_CROP_
     fig.savefig(cache_dir / "mean.png", dpi=120)
     plt.close(fig)
 
-    result = {"mean": mean_img, "std": std_img, "align_reference": align_reference, "scores": scores}
+    result = {
+        "mean": mean_img, "std": std_img, "align_reference": align_reference,
+        "rotation_reference": rotation_reference, "scores": scores,
+    }
     if missing:
         result["missing_sources"] = [
             {"image_dir": d, "sheet": s} for d, s in missing
@@ -323,6 +397,10 @@ def compare_to_batch_reference(
     # function needs, which silently errored instead of comparing anything.
     # Resolving it here is more reliable than depending on prompting alone.
     image_dir = image_dir or (f"reference_images/{batch}" if batch else "")
+    # Captured before the electrode_code+image_dir catalog lookup below can
+    # overwrite image_path -- True only for a direct upload (expected to show
+    # one electrode), same distinction qc_sensor_image's gate makes.
+    expect_single_electrode = bool(image_path)
 
     if not image_path:
         if not electrode_code or not image_dir:
@@ -398,6 +476,30 @@ def compare_to_batch_reference(
     if error:
         return {"status": "error", "message": error}
 
+    # Framing-QC gate, same as qc_sensor_image's -- refuses to build/compare
+    # against a photo that's unusable to begin with (blurred, wrong subject,
+    # multiple electrodes when one was expected, etc.) rather than quietly
+    # computing an SSIM score against garbage input. This tool is reachable
+    # directly by the agent (not only via qc_sensor_image), so it needs its
+    # own gate rather than relying on qc_sensor_image's -- confirmed this was
+    # a real gap, not a hypothetical one: an early version of this feature
+    # only gated qc_sensor_image, and a bad photo could still reach a full
+    # SSIM comparison through this tool untouched.
+    mime_type = _MIME_TYPES.get(Path(image_path).suffix.lower(), "image/jpeg")
+    framing = check_photo_framing(
+        image_bytes=Path(image_path).read_bytes(), mime_type=mime_type,
+        expect_single_electrode=expect_single_electrode,
+    )
+    if not framing["proceed"]:
+        return {
+            "status": "framing_rejected",
+            "framing_ok": False,
+            "issues": framing["issues"],
+            "user_message": framing["user_message"],
+            "electrode_code": electrode_code or None,
+            "measurements": framing.get("measurements"),
+        }
+
     try:
         reference = build_batch_reference(sources, cache_dir, crop_box, force_rebuild)
     except ValueError as e:
@@ -405,6 +507,7 @@ def compare_to_batch_reference(
     if "error" in reference:
         return {"status": "error", "message": reference["error"]}
     mean_img, align_reference, batch_scores = reference["mean"], reference["align_reference"], reference["scores"]
+    rotation_reference = reference["rotation_reference"]
 
     try:
         # rotation_degrees applies only to this target image, not the
@@ -414,6 +517,15 @@ def compare_to_batch_reference(
         target_raw = _luminance_grid(image_path, GRID_SIZE, True, 1.0, crop_box, rotation_degrees)
     except ValueError as e:
         return {"status": "error", "message": str(e)}
+
+    # Auto-detect any residual tilt against the reference orientation --
+    # runs regardless of whether rotation_degrees was given, since a manual
+    # value is a coarse seed, not guaranteed exact. Comes out ~0 when the
+    # target is already well-aligned, so this is a no-op in the common case.
+    auto_rotation = _estimate_rotation(target_raw, rotation_reference)
+    if auto_rotation:
+        target_raw = nd_rotate(_match_shape(target_raw, align_reference.shape), auto_rotation, reshape=False, mode="nearest", order=1)
+
     target = _trim_margin(_align(target_raw, align_reference))  # same registration as the reference average
     ssim_score, ssim_map = structural_similarity(target, mean_img, data_range=255, full=True)
 
@@ -464,7 +576,10 @@ def compare_to_batch_reference(
         "status": status,
         "electrode_code": electrode_code or None,
         "reference_scope": reference_scope,
+        "source_image_path": str(image_path),
         "diff_plot_path": str(diff_path),
+        "rotation_degrees_requested": rotation_degrees,
+        "rotation_degrees_auto_detected": auto_rotation,
         "metrics": {
             "ssim_vs_batch_average": ssim_score,
             "batch_percentile": percentile,

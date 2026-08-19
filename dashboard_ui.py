@@ -33,6 +33,7 @@ _STATUS_STYLE = {
     "error": ("\U0001f534", "red"),
     "insufficient_data": ("ℹ️", "gray"),
     "no_prediction": ("ℹ️", "gray"),
+    "framing_rejected": ("\U0001f4f7", "orange"),
 }
 
 
@@ -111,6 +112,16 @@ def render_ca_calibration(result: dict) -> None:
 
 def render_image_qc(result: dict) -> None:
     status_badge(result.get("status"))
+    if result.get("status") == "framing_rejected":
+        # No defect analysis was attempted -- the framing gate refused to
+        # guess on an unusable photo, so this stops here rather than
+        # falling through to the defects/surface-analysis sections below,
+        # which would just render as empty and read like a clean pass.
+        st.warning(result.get("user_message", "Photo framing failed the pre-analysis check."))
+        issues = result.get("issues", [])
+        if issues:
+            st.caption("issues detected: " + ", ".join(i.replace("_", " ") for i in issues))
+        return
     if result.get("proxy_image"):
         st.info(f"Proxy image -- showing {result.get('used_electrode')} (grid distance {result.get('grid_distance')}) instead of the requested {result.get('requested_electrode')}.")
     if result.get("rotation_degrees_applied"):
@@ -135,6 +146,15 @@ def render_image_qc(result: dict) -> None:
 
 def render_compare_to_batch_reference(result: dict) -> None:
     status_badge(result.get("status"))
+    if result.get("status") == "framing_rejected":
+        st.warning(result.get("user_message", "Photo framing failed the pre-analysis check."))
+        issues = result.get("issues", [])
+        if issues:
+            st.caption("issues detected: " + ", ".join(i.replace("_", " ") for i in issues))
+        return
+    auto_rot = result.get("rotation_degrees_auto_detected")
+    if auto_rot:
+        st.caption(f"\U0001f504 Auto-straightened {auto_rot:+.2f}° to match the reference orientation before comparing.")
     m = result.get("metrics", {})
     cols = st.columns(3)
     cols[0].metric("SSIM vs. Batch Avg", _fmt(m.get("ssim_vs_batch_average")), border=True)
@@ -171,6 +191,17 @@ def render_compare_cv_to_batch_reference(result: dict) -> None:
     _flags(result.get("flags"))
 
 
+def render_check_photo_framing(result: dict) -> None:
+    ok = result.get("framing_ok")
+    st.markdown(":green[✅ **FRAMING OK**]" if ok else ":orange[\U0001f4f7 **FRAMING ISSUES**]")
+    st.caption(result.get("user_message", ""))
+    issues = result.get("issues", [])
+    if issues:
+        cols = st.columns(min(len(issues), 5))
+        for col, issue in zip(cols, issues):
+            col.metric("issue", issue.replace("_", " "), border=True)
+
+
 DASHBOARD_RENDERERS = {
     "sensor_qc": render_sensor_qc,
     "analyze_cv_stability": render_cv_stability,
@@ -178,6 +209,7 @@ DASHBOARD_RENDERERS = {
     "image_qc": render_image_qc,
     "compare_to_batch_reference": render_compare_to_batch_reference,
     "compare_cv_to_batch_reference": render_compare_cv_to_batch_reference,
+    "check_photo_framing": render_check_photo_framing,
 }
 
 
