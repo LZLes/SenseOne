@@ -7,24 +7,40 @@ this catches that upstream and refuses to guess, rather than quietly
 returning a low-confidence "pass"/"fail" built on unusable input.
 
 Hybrid design (deliberately, not for lack of trying a single approach):
-  - Blur, lighting, and off-centre/cut-off are checked with deterministic
-    image processing -- free, instant, zero API dependency, and fully
-    testable offline against synthetic images.
-  - Everything else -- wrong subject entirely (not_electrode), angle,
-    overlapping electrodes, unexpected multiple electrodes, flipped/reverse
-    side, and physical tampering -- is checked with a single Gemini vision
-    call. All of these genuinely need holistic scene understanding a
-    geometric heuristic can't reliably provide here (see below), so they're
-    deliberately not force-fit into heuristics just to avoid the API call;
-    bundled into one call rather than one call per issue to keep the cost
-    profile the same as just checking angle/overlap alone.
-  - The vision call only runs if the deterministic checks already passed.
-    A dark or blurry photo never reaches the API at all -- saves quota on
-    the "obviously bad" case, at a disclosed cost: if a photo is BOTH
-    badly lit AND, say, angled, only the lighting issue is reported (the
-    deterministic checks themselves never short-circuit each other --
-    blur/lighting/off-centre are always all three checked and all
-    genuine simultaneous issues among *those* are reported together).
+  - A minimal, focused vision call ("is this even a recognizable electrode
+    photo?") runs FIRST, before anything else, on every photo -- not gated
+    behind the cheap checks. This was a deliberate cost/completeness
+    tradeoff, not the original design: gating it behind the cheap checks
+    (as everything else here still is) meant a genuinely wrong-subject photo
+    that also happened to be dark or low-content got reported as "poor
+    lighting" instead, since the vision call that could actually say "this
+    isn't an electrode" never ran -- confirmed empirically with a starfield
+    test image. Subject validity is different in kind from the other checks:
+    every other issue here describes a real electrode photo shot badly;
+    this one means there's no electrode to describe at all, and a
+    researcher deserves to know that specifically, not a misleading "retake
+    with better lighting" for a photo of the wrong thing entirely.
+  - If that check finds no electrode, everything below is skipped -- no
+    point measuring the blur of a photo of someone's lunch.
+  - Otherwise, blur, lighting, and off-centre/cut-off are checked with
+    deterministic image processing -- free, instant, zero API dependency,
+    and fully testable offline against synthetic images.
+  - Angle, overlapping electrodes, unexpected multiple electrodes, mixed
+    electrode types, flipped/reverse side, and physical tampering are
+    checked with a second, bundled Gemini vision call -- all genuinely need
+    holistic scene understanding a geometric heuristic can't reliably
+    provide here (see below), so they're deliberately not force-fit into
+    heuristics just to avoid the API call. This second call only runs if
+    the deterministic checks already passed -- a dark or blurry (but real)
+    electrode photo never reaches it, at a disclosed cost: if a real
+    electrode photo is BOTH badly lit AND, say, angled, only the lighting
+    issue is reported (the deterministic checks themselves never short-
+    circuit each other -- blur/lighting/off-centre are always all three
+    checked and all genuine simultaneous issues among *those* are reported
+    together).
+  - Net cost profile: every photo now costs at least one small vision call
+    (previously, a badly-lit or blurry photo cost zero); a real, usable-
+    looking electrode photo costs two.
 
 Why angle/overlap aren't deterministic here, concretely: a geometric
 heuristic (Hough-line angle, contour-overlap) needs to already know what
@@ -186,44 +202,84 @@ def _check_off_centre(gray: np.ndarray) -> dict:
     }
 
 
+_NOT_ELECTRODE_PROMPT = """Does this photo show a screen-printed electrode (SPE) biosensor strip
+at all? Flag this if it's clearly something else entirely (a random object, a person, a document/
+diagram, a blank surface, an unrelated lab item) -- not for a real electrode that's just hard to
+see well, badly lit, blurry, or awkwardly framed; those are checked separately elsewhere and are
+NOT this check's concern. Only flag when the subject itself is wrong, not the photo quality.
+
+Respond with ONLY a JSON object, no other text, in exactly this shape:
+{"not_electrode": true or false, "not_electrode_reason": "short specific description or null"}
+"""
+
+
+def _vision_not_electrode_check(image_bytes: bytes, mime_type: str) -> dict:
+    """Runs first, before anything else in check_photo_framing -- see module
+    docstring for why subject validity isn't gated behind the cheap checks
+    the way the rest of the vision-based checks still are. Deliberately its
+    own minimal call (one short question, not the full bundle below) to keep
+    the added cost as small as possible given it now runs on every photo.
+    """
+    import json as _json
+
+    from google.genai import types as _types
+
+    from tools._gemini import client, MODEL, request_slot
+
+    try:
+        with request_slot():
+            response = client().models.generate_content(
+                model=MODEL,
+                contents=[_types.Content(role="user", parts=[
+                    _types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+                    _types.Part.from_text(text=_NOT_ELECTRODE_PROMPT),
+                ])],
+                config=_types.GenerateContentConfig(temperature=0, thinking_config=_types.ThinkingConfig(include_thoughts=False)),
+            )
+        text = (response.text or "").strip()
+        if text.startswith("```"):
+            text = text.strip("`")
+            text = text[text.find("{"):]
+        parsed = _json.loads(text)
+        return {"checked": True, "not_electrode": bool(parsed.get("not_electrode")), "not_electrode_reason": parsed.get("not_electrode_reason")}
+    except Exception as e:
+        return {"checked": False, "error": str(e)}
+
+
 _VISION_PROMPT_TEMPLATE = """Look at this photo for framing/subject issues only -- ignore blur,
 lighting, and cropping, those are already checked separately. Also ignore print quality
 defects (missing ink, streaking, contamination) -- that's a separate downstream analysis,
-not this check.
+not this check. The photo has already been confirmed to show a real electrode, so don't
+re-assess that -- assume it's a genuine electrode photo and focus only on the below.
 
-1. NOT_ELECTRODE: does this photo show a screen-printed electrode (SPE) biosensor strip at
-   all? Flag this if it's clearly something else entirely (a random object, a person, a blank
-   surface, an unrelated lab item) -- not for a real electrode that's just hard to see well.
-
-2. ANGLE: is the electrode strip itself rotated/tilted relative to the frame edges (not
+1. ANGLE: is the electrode strip itself rotated/tilted relative to the frame edges (not
    perfectly axis-aligned)? A few degrees of tilt is fine and common; only flag a clearly,
    visibly angled strip that would make a fixed analysis region miss the electrode.
 
-3. OVERLAP: are two or more physical electrode strips touching or crossing each other?
+2. OVERLAP: are two or more physical electrode strips touching or crossing each other?
    IMPORTANT: it is completely normal and expected for ONE photo to contain multiple separate
    electrodes side by side on the same sheet (e.g. a row or grid of several strips) -- that is
    NOT overlap and must NOT be flagged. Only flag this if strips are physically touching,
    crossing, or stacked on top of each other in a way that makes them hard to tell apart.
 {multiple_electrodes_instruction}
-4. FLIPPED: is the strip shown from its back/reverse side rather than its printed front (e.g.
+3. FLIPPED: is the strip shown from its back/reverse side rather than its printed front (e.g.
    you see plain blank substrate instead of the printed working/counter/reference electrode
    pads, or the contact pins are on the visibly wrong side)? Only flag a clear reverse-side
    shot, not just an unusual viewing angle of the correct (front) side.
 
-5. TAMPERED: does the electrode show clear signs of deliberate physical alteration or damage
+4. TAMPERED: does the electrode show clear signs of deliberate physical alteration or damage
    -- a cut, hole, scratch gouge, foreign object deliberately placed on it, or similar --
    distinct from a normal manufacturing print defect (which is NOT this check's concern)?
    Only flag obvious physical tampering/damage to the strip itself, not print-quality issues.
 
-6. MIXED_TYPES: if more than one electrode is visible in frame, do they all appear to be the
+5. MIXED_TYPES: if more than one electrode is visible in frame, do they all appear to be the
    SAME electrode type/design (same pad shape and layout, same number of electrodes per
    strip)? Flag mixed_types only if you can see clearly different electrode designs mixed
    together in one frame -- not for minor print-to-print variation of the same design, and
    not applicable at all when only one electrode is visible (leave false).
 
 Respond with ONLY a JSON object, no other text, in exactly this shape:
-{{"not_electrode": true or false, "not_electrode_reason": "short specific description or null",
- "angled": true or false, "angle_reason": "short specific description or null",
+{{"angled": true or false, "angle_reason": "short specific description or null",
  "overlapping": true or false, "overlap_reason": "short specific description or null",
  "multiple_electrodes": true or false, "multiple_electrodes_reason": "short specific description or null",
  "flipped": true or false, "flipped_reason": "short specific description or null",
@@ -274,7 +330,6 @@ def _vision_framing_check(image_bytes: bytes, mime_type: str, expect_single_elec
         parsed = _json.loads(text)
         return {
             "checked": True,
-            "not_electrode": bool(parsed.get("not_electrode")), "not_electrode_reason": parsed.get("not_electrode_reason"),
             "angled": bool(parsed.get("angled")), "angle_reason": parsed.get("angle_reason"),
             "overlapping": bool(parsed.get("overlapping")), "overlap_reason": parsed.get("overlap_reason"),
             "multiple_electrodes": bool(parsed.get("multiple_electrodes")) if expect_single_electrode else False,
@@ -298,11 +353,12 @@ FRAMING_QC_SCHEMA = {
         "description": (
             "Check whether an electrode photo is well-framed enough to analyze at all, "
             "BEFORE running sensor_qc-style defect analysis on it -- catches: the subject not "
-            "being a recognizable electrode at all, an angled/rotated shot, overlapping "
-            "electrodes (or multiple electrodes when only one was expected), mixed electrode "
-            "types in one frame, a flipped/reverse-side shot, visible tampering/physical damage, "
-            "an off-centre/cut-off frame, poor lighting (too dark or blown-out glare), too-low "
-            "resolution, and excessive blur. qc_sensor_image already "
+            "being a recognizable electrode at all (checked first, on every photo, before "
+            "anything else), an angled/rotated shot, overlapping electrodes (or multiple "
+            "electrodes when only one was expected), mixed electrode types in one frame, a "
+            "flipped/reverse-side shot, visible tampering/physical damage, an off-centre/cut-off "
+            "frame, poor lighting (too dark or blown-out glare), too-low resolution, and "
+            "excessive blur. qc_sensor_image already "
             "runs this automatically as its first step and will refuse to guess on a bad photo, "
             "so you don't need to call this separately before qc_sensor_image -- use it "
             "standalone only when the researcher asks specifically whether a photo is good "
@@ -355,6 +411,24 @@ def check_photo_framing(
     except Exception as e:
         return {"framing_ok": False, "issues": ["unreadable_image"], "user_message": f"Could not decode image: {e}", "proceed": False}
 
+    # Subject-validity check runs first, before anything else -- see module
+    # docstring for why this specifically isn't gated behind the cheap
+    # checks the way the rest of the vision-based checks still are.
+    not_electrode_result = _vision_not_electrode_check(image_bytes, mime_type)
+    if not not_electrode_result.get("checked"):
+        return {
+            "framing_ok": False, "issues": ["framing_check_incomplete"],
+            "user_message": f"Couldn't verify this is a usable electrode photo ({not_electrode_result.get('error', 'vision check failed')}) -- try again before relying on this analysis.",
+            "proceed": False, "measurements": {"not_electrode": not_electrode_result},
+        }
+    if not_electrode_result["not_electrode"]:
+        reason = not_electrode_result.get("not_electrode_reason") or "this doesn't look like an electrode photo"
+        return {
+            "framing_ok": False, "issues": ["not_electrode"],
+            "user_message": f"This doesn't look like an electrode photo ({reason}) -- retake a photo of the SPE strip itself.",
+            "proceed": False, "measurements": {"not_electrode": not_electrode_result},
+        }
+
     resolution = _check_resolution(image_bytes)
     blur = _check_blur(gray)
     lighting = _check_lighting(gray)
@@ -387,13 +461,6 @@ def check_photo_framing(
             issues.append("framing_check_incomplete")
             messages.append(f"Couldn't verify framing/subject ({vision.get('error', 'vision check failed')}) -- try again before relying on this analysis.")
         else:
-            # not_electrode first -- if the subject itself is wrong, that's the
-            # one issue actually worth leading with; the others are moot on a
-            # photo of the wrong thing entirely.
-            if vision["not_electrode"]:
-                issues.append("not_electrode")
-                reason = vision.get("not_electrode_reason") or "this doesn't look like an electrode photo"
-                messages.append(f"This doesn't look like an electrode photo ({reason}) -- retake a photo of the SPE strip itself.")
             if vision["angled"]:
                 issues.append("angled")
                 reason = vision.get("angle_reason") or "the electrode is tilted relative to the frame"
@@ -426,6 +493,7 @@ def check_photo_framing(
         "user_message": " ".join(messages) if messages else "Framing looks good.",
         "proceed": framing_ok,
         "measurements": {
+            "not_electrode": not_electrode_result,
             "resolution": resolution, "blur": blur, "lighting": lighting, "off_centre": off_centre,
             "vision": vision,
         },

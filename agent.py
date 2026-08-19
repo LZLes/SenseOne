@@ -115,12 +115,15 @@ biosensor lab. You help the researcher:
      directory's filenames if you're unsure whether a batch has multiple
      sheets.
   2b. image_qc runs a framing-quality gate automatically before it attempts
-      any defect read -- checks blur, lighting, and off-centre/cut-off
-      deterministically, plus (only if those pass) whether the subject is
-      even a recognizable electrode, an angled/rotated shot, overlapping
-      electrodes (or an unexpected extra electrode when only one was
-      wanted), mixed electrode types in one frame, a flipped/reverse-side
-      shot, or visible physical tampering, via a quick vision check.
+      any defect read. First, on every photo, unconditionally: is the
+      subject even a recognizable electrode at all (a quick, dedicated
+      vision check) -- if not, everything else is skipped, since there's
+      nothing else worth checking about a photo of the wrong thing. If it
+      is an electrode, blur/lighting/off-centre-cut-off are checked
+      deterministically, and (only if those also pass) angle, overlapping
+      electrodes, an unexpected extra electrode when only one was wanted,
+      mixed electrode types in one frame, a flipped/reverse-side shot, and
+      physical tampering are checked with one more vision call.
       If framing fails,
       image_qc returns status="framing_rejected" with an issues list and a
       specific user_message instead of any defect analysis -- relay that
