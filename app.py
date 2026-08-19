@@ -76,6 +76,50 @@ def _find_image_paths(obj, found=None, _depth=0, _max_depth=25):
     return found
 
 
+def _scalarize(value):
+    """Flattens a value too complex for a single table cell into a short
+    readable string -- a plain list becomes a comma-joined line, anything
+    else falls back to compact JSON, so the properties table never has to
+    drop a field just because it wasn't a flat scalar.
+    """
+    if isinstance(value, list):
+        if all(isinstance(v, (str, int, float, bool, type(None))) for v in value):
+            return ", ".join(str(v) for v in value) if value else "—"
+        return json.dumps(value, default=str)
+    if isinstance(value, dict):
+        return json.dumps(value, default=str)
+    return value
+
+
+def _render_as_table(result: dict) -> None:
+    """Fallback for tool results with no bespoke dashboard_ui renderer --
+    a table reads far faster than a nested JSON blob for the common shapes
+    these tools return (a list of records, or a dict-of-records keyed by
+    id). List-of-dict fields (e.g. list_electrode_notes' "notes",
+    search_literature's "results") become their own st.dataframe; dict-of-
+    dict fields (e.g. get_batch_metadata's "sheets") become a table keyed
+    by their own dict key. Everything else -- scalars, and anything too
+    irregular to tabulate -- lands in one small properties table at the
+    end, so nothing from the raw result is ever silently dropped.
+    """
+    scalars = {}
+    for key, value in result.items():
+        if isinstance(value, list) and value and all(isinstance(v, dict) for v in value):
+            st.caption(key.replace("_", " "))
+            st.dataframe(value, width="stretch", hide_index=True)
+        elif isinstance(value, dict) and value and all(isinstance(v, dict) for v in value.values()):
+            st.caption(key.replace("_", " "))
+            rows = [{"id": k, **v} for k, v in value.items()]
+            st.dataframe(rows, width="stretch", hide_index=True)
+        else:
+            scalars[key] = value
+    if scalars:
+        st.dataframe(
+            [{"field": k.replace("_", " "), "value": _scalarize(v)} for k, v in scalars.items()],
+            width="stretch", hide_index=True,
+        )
+
+
 def _render_tool_call(call, result_str, collected_images):
     name = call["function"]["name"]
     args = call["function"]["arguments"]
@@ -96,21 +140,81 @@ def _render_tool_call(call, result_str, collected_images):
                     # Dashboard rendering is a presentation nicety on top of
                     # the real result -- a formatting bug in it (e.g. an
                     # unexpected field shape) should never hide the actual
-                    # QC data, so fall through to the plain JSON view below.
-                    st.caption("result")
-                    st.json(result)
+                    # QC data, so fall through to the table view below.
+                    _render_as_table(result)
                 else:
                     with st.expander("raw result"):
                         st.json(result)
             else:
-                st.caption("result")
-                st.json(result)
+                try:
+                    _render_as_table(result)
+                except Exception:
+                    # Same belt-and-suspenders logic as above -- an
+                    # unexpectedly-shaped result should never hide the data.
+                    st.json(result)
             images = _find_image_paths(result)
             collected_images.extend(images)
             status.update(label=f"\U0001f527 {name} -- {result.get('status', 'done')}", state="complete")
         else:
             st.text(result_str)
             status.update(label=f"\U0001f527 {name}", state="complete")
+
+
+def _render_history(contents: list, turn_images: dict) -> None:
+    """Replays session history into the chat UI, including every past tool
+    call -- not just the final answer text. Without this, a tool-call panel
+    (arguments, dashboard card/table) only ever rendered for the single
+    script run where it streamed in live; the very next rerun (a new
+    message, a retry, anything) silently dropped it, even though the
+    underlying function_call/function_response Content entries were still
+    sitting right there in `contents` the whole time. Reconstructing the
+    display straight from `contents` (rather than caching a second, parallel
+    display log) keeps there being exactly one source of truth.
+
+    Walks contents as a flat index rather than a for-loop since one logical
+    assistant turn can span several Content entries (one model-with-
+    function_call + one user-with-function_response per tool-call round),
+    all of which need grouping into a single chat bubble to match how the
+    turn looked live.
+    """
+    i, n = 0, len(contents)
+    while i < n:
+        content = contents[i]
+        if content.role == "user" and not any(getattr(p, "function_response", None) for p in content.parts):
+            with st.chat_message("user"):
+                st.markdown("".join(p.text for p in content.parts if p.text))
+            i += 1
+        elif content.role == "model":
+            with st.chat_message("assistant"):
+                final_text, final_index = None, i
+                while i < n and contents[i].role == "model":
+                    model_content = contents[i]
+                    calls = [p.function_call for p in model_content.parts if getattr(p, "function_call", None)]
+                    if calls:
+                        i += 1
+                        pending = {}
+                        if i < n and contents[i].role == "user":
+                            for p in contents[i].parts:
+                                fr = getattr(p, "function_response", None)
+                                if fr:
+                                    pending.setdefault(fr.name, []).append(fr.response)
+                            i += 1
+                        for fc in calls:
+                            args = dict(fc.args) if fc.args else {}
+                            call_display = {"function": {"name": fc.name, "arguments": args}}
+                            bucket = pending.get(fc.name)
+                            result = bucket.pop(0) if bucket else {}
+                            _render_tool_call(call_display, json.dumps(result, default=str), [])
+                    else:
+                        text = "".join(p.text for p in model_content.parts if p.text and not getattr(p, "thought", False))
+                        if text:
+                            final_text, final_index = text, i
+                        i += 1
+                if final_text:
+                    st.markdown(final_text)
+                _render_image_gallery(turn_images.get(final_index, []))
+        else:
+            i += 1  # stray function_response-only content with no preceding call -- shouldn't happen, skip defensively
 
 
 def _render_image_gallery(images):
@@ -418,16 +522,7 @@ def chat_page() -> None:
     st.title("\U0001f52c SenseOne")
     st.caption("Gemini-backed research assistant for the electrochemical biosensor lab.")
 
-    for i, content in enumerate(st.session_state.contents):
-        if content.role == "user" and not any(getattr(p, "function_response", None) for p in content.parts):
-            with st.chat_message("user"):
-                st.markdown("".join(p.text for p in content.parts if p.text))
-        elif content.role == "model" and not any(getattr(p, "function_call", None) for p in content.parts):
-            text = "".join(p.text for p in content.parts if p.text and not getattr(p, "thought", False))
-            if text:
-                with st.chat_message("assistant"):
-                    st.markdown(text)
-                    _render_image_gallery(st.session_state.turn_images.get(i, []))
+    _render_history(st.session_state.contents, st.session_state.turn_images)
 
     def _handle_turn(display_text: str, model_text: str, caption: str = None) -> None:
         """Runs one full user turn: appends the user message, streams the
