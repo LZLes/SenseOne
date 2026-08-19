@@ -659,6 +659,27 @@ def guide_page() -> None:
         "It stops once it has no more tool calls left to make, or after a hop-count safety cap "
         "if something goes wrong (protects the shared API quota from a runaway loop)."
     )
+    st.graphviz_chart("""
+        digraph {
+            rankdir=TB;
+            bgcolor="transparent";
+            node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=12, margin="0.18,0.1", color="#4472C4"];
+            edge [fontname="Helvetica", fontsize=10, color="#666666", fontcolor="#666666"];
+
+            input [label="Researcher message\n(+ optional photo)", fillcolor="#E8EEF9"];
+            agent [label="Gemini reasons:\nwhich tool(s) does this need?", fillcolor="#FFF2CC", color="#BF9000"];
+            tools [label="Tool(s) called\n(sensor_qc, image_qc,\nsearch_literature, ...)", fillcolor="#E2F0D9", color="#548235"];
+            result [label="Result fed back\ninto the conversation", fillcolor="#E2F0D9", color="#548235"];
+            answer [label="Grounded final answer\n(every number traces to a call)", fillcolor="#E8EEF9"];
+
+            input -> agent;
+            agent -> tools [label="needs a tool"];
+            tools -> result;
+            result -> agent [label="loop: more tools needed?", style=dashed];
+            agent -> answer [label="no more tools needed"];
+        }
+    """)
+    st.caption("One turn can loop through this several times before you see an answer -- e.g. framing check, then defect read, then a literature search for a fix, all in one response.")
     st.markdown(
         "**Nothing is hidden.** Every tool call streams into its own expandable panel in the "
         "chat -- the exact arguments sent and the exact result returned, before the final answer "
@@ -680,8 +701,35 @@ def guide_page() -> None:
     st.markdown(
         "Every photo goes through an automatic framing check before any analysis happens -- a "
         "photo that fails is rejected outright with a specific reason, not silently guessed at. "
-        "For it to pass:"
+        "Subject validity is checked first, on every photo, before anything else -- there's no "
+        "point measuring the blur of a photo of the wrong thing entirely:"
     )
+    st.graphviz_chart("""
+        digraph {
+            rankdir=TB;
+            bgcolor="transparent";
+            node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=11, margin="0.15,0.08", color="#4472C4"];
+            edge [fontname="Helvetica", fontsize=9, color="#666666", fontcolor="#666666"];
+
+            photo [label="Photo submitted", fillcolor="#E8EEF9"];
+            subject [label="Is this a recognizable\nelectrode at all?", shape=diamond, fillcolor="#FFF2CC", color="#BF9000"];
+            reject1 [label="Rejected: not an electrode", fillcolor="#FCE4E4", color="#C00000"];
+            cheap [label="Blur / lighting /\noff-centre / resolution", shape=diamond, fillcolor="#FFF2CC", color="#BF9000"];
+            reject2 [label="Rejected, specific reason\n(e.g. \\"too dark\\")", fillcolor="#FCE4E4", color="#C00000"];
+            vision [label="Angle / overlap / flipped /\ntampered / mixed types", shape=diamond, fillcolor="#FFF2CC", color="#BF9000"];
+            reject3 [label="Rejected, specific reason\n(e.g. \\"electrodes overlap\\")", fillcolor="#FCE4E4", color="#C00000"];
+            analyze [label="Proceeds to analysis", fillcolor="#E2F0D9", color="#548235"];
+
+            photo -> subject;
+            subject -> reject1 [label="no"];
+            subject -> cheap [label="yes"];
+            cheap -> reject2 [label="fails"];
+            cheap -> vision [label="passes"];
+            vision -> reject3 [label="fails"];
+            vision -> analyze [label="passes"];
+        }
+    """)
+    st.markdown("In full, a photo needs to be:")
     st.markdown(
         "- **One electrode, correctly identified as one** -- a real SPE strip, not a batch sheet, "
         "a design mockup, or something else entirely\n"
